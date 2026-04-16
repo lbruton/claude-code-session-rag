@@ -296,7 +296,8 @@ async def lifespan(app: Starlette):
         watcher = await file_watcher.start_global_watcher(db_path)
         if watcher:
             # Full backfill across all projects in background
-            asyncio.create_task(watcher.backfill())
+            # Delay lets HTTP server finish binding before embedding work starts
+            asyncio.create_task(watcher.backfill(startup_delay=3))
     except Exception as e:
         print(f"[HTTP] Warning: Global watcher start failed: {e}", file=sys.stderr)
 

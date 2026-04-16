@@ -25,6 +25,54 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
 
+def detect_project_root(transcript_path: str, max_lines: int = 30) -> str:
+    """Peek at a transcript's first lines to extract the working directory.
+
+    Claude Code transcripts embed ``cwd`` on user/assistant/progress entries.
+    We grab the first non-trivial ``cwd`` (i.e. not ``"/"`` or empty) and
+    resolve it to a git toplevel when possible.  This lets us tag transcripts
+    living in the generic ``-/`` bucket with their real project root.
+
+    Returns "" if no usable cwd is found.
+    """
+    try:
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cwd = entry.get("cwd", "")
+                if not cwd or cwd == "/":
+                    continue
+                # Accept paths with at least two components (e.g. /Users/x)
+                if cwd.count("/") >= 2:
+                    return _resolve_git_root(cwd)
+    except (IOError, OSError):
+        pass
+    return ""
+
+
+def _resolve_git_root(cwd: str) -> str:
+    """Try to resolve *cwd* to the git repo toplevel, fall back to cwd itself."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return cwd
+
+
 def parse_transcript(
     transcript_path: str,
     session_id: str,

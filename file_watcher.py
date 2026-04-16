@@ -104,7 +104,35 @@ def register_project(project_root: str):
 
 def _get_project_root_for_slug(slug: str) -> str:
     """Look up the project root for a slug. Returns "" if unknown."""
-    return _slug_map.get(slug, "")
+    if slug in _slug_map:
+        return _slug_map[slug]
+    # Attempt to derive path from slug: "-Volumes-DATA-GitHub-Foo" -> "/Volumes/DATA/GitHub/Foo"
+    # Slugs replace / with - and . with -, so we try the naive reversal and check if it exists.
+    if slug and slug.startswith("-") and len(slug) > 1:
+        candidate = slug.replace("-", "/", 1)  # first dash -> leading /
+        # Remaining dashes are ambiguous (could be path separators or literal dashes).
+        # Try progressively replacing dashes with / from the left and check if the path exists.
+        parts = candidate.split("-")
+        # Rebuild: greedily join segments where the path prefix exists on disk
+        rebuilt = parts[0]
+        for part in parts[1:]:
+            with_slash = rebuilt + "/" + part
+            with_dash = rebuilt + "-" + part
+            # Prefer the slash variant if the directory exists
+            if os.path.isdir(with_slash):
+                rebuilt = with_slash
+            elif os.path.isdir(with_dash):
+                rebuilt = with_dash
+            else:
+                # Neither exists yet — assume slash (more common)
+                rebuilt = with_slash
+        if os.path.isdir(rebuilt):
+            # Cache it so we don't re-derive every time
+            _slug_map[slug] = rebuilt
+            _save_slug_map()
+            _log(f"Derived slug {slug} -> {rebuilt}")
+            return rebuilt
+    return ""
 
 
 # --- TranscriptChangeHandler ---
@@ -259,6 +287,9 @@ class GlobalTranscriptWatcher:
 
                 slug = _slug_from_transcript_path(transcript_path)
                 project_root = _get_project_root_for_slug(slug) if slug else ""
+                if not project_root:
+                    project_root = transcript_parser.detect_project_root(
+                        transcript_path)
                 session_id = Path(transcript_path).stem
 
                 offset = transcript_parser.get_transcript_offset(
@@ -302,12 +333,17 @@ class GlobalTranscriptWatcher:
             if self._pending_files:
                 self._reset_debounce()
 
-    async def backfill(self, slug_filter: Optional[str] = None):
+    async def backfill(self, slug_filter: Optional[str] = None,
+                       startup_delay: float = 0):
         """Index all unindexed or partially-indexed transcript files.
 
         If slug_filter is provided, only backfill that slug's directory.
         Otherwise, backfill ALL project slug directories.
+        startup_delay: seconds to wait before starting (lets HTTP server bind first).
         """
+        if startup_delay > 0:
+            await asyncio.sleep(startup_delay)
+
         if not _CLAUDE_PROJECTS.is_dir():
             return 0
 
@@ -334,6 +370,8 @@ class GlobalTranscriptWatcher:
             if offset < file_size:
                 slug = _slug_from_transcript_path(path)
                 project_root = _get_project_root_for_slug(slug) if slug else ""
+                if not project_root:
+                    project_root = transcript_parser.detect_project_root(path)
                 needs_indexing.append((path, t.stem, offset, project_root))
 
         if not needs_indexing:
@@ -346,7 +384,9 @@ class GlobalTranscriptWatcher:
              f"transcripts need indexing...")
 
         total_indexed = 0
-        for transcript_path, session_id, offset, project_root in needs_indexing:
+        errors = 0
+        for i, (transcript_path, session_id, offset, project_root) in enumerate(
+                needs_indexing):
             try:
                 turns, new_offset = transcript_parser.parse_transcript(
                     transcript_path, session_id, start_offset=offset
@@ -365,9 +405,20 @@ class GlobalTranscriptWatcher:
 
             except Exception as e:
                 _log(f"Backfill error {Path(transcript_path).name}: {e}")
+                errors += 1
+                # On Milvus errors, pause longer to let gRPC recover
+                if "GOAWAY" in str(e) or "readonly" in str(e) or "connection" in str(e).lower():
+                    _log("Backfill: Milvus error detected, pausing 5s for recovery...")
+                    await asyncio.sleep(5)
 
-            # Yield control periodically
-            await asyncio.sleep(0)
+            # Throttle: yield control + small delay to avoid Milvus gRPC GOAWAY
+            await asyncio.sleep(0.05)
+
+            # Checkpoint every 100 files so progress survives crashes
+            if (i + 1) % 100 == 0:
+                transcript_parser.save_index_state(state)
+                _log(f"Backfill ({scope}): {i + 1}/{len(needs_indexing)} files, "
+                     f"{total_indexed} turns, {errors} errors")
 
         transcript_parser.save_index_state(state)
         _log(f"Backfill ({scope}) complete: {total_indexed} turns indexed from "

@@ -1,0 +1,278 @@
+# session-rag
+
+Semantic search over Claude Code session transcripts. Recovers information lost to context compression — decisions, code snippets, error messages, and reasoning from past conversations.
+
+## How It Works
+
+Claude Code compresses older messages when conversations get long. Once compressed, the original content is lost. Session-rag indexes conversation turns into a vector database so Claude can search past discussions.
+
+- **Embedding model**: EmbeddingGemma-300M (default) or ModernBERT Embed Base, via `mlx-embeddings` on Apple Silicon
+- **Vector store**: Milvus Lite (global DB at `~/.session-rag/milvus.db`)
+- **Indexing**: File watcher (watchdog) monitors transcript files in real time, plus Stop/PreCompact hooks as backup
+- **Backfill**: On session start, automatically indexes any transcripts that were missed
+- **Server**: HTTP MCP server on port 7102
+- **Memory**: ~350-400 MB model footprint
+
+## Quick Start
+
+```bash
+# 1. Install (sets up venv, deps, model, hooks, AND global MCP server)
+./setup.sh
+
+# 2. Restart Claude Code to activate
+```
+
+Setup installs the MCP server globally (user scope in `~/.claude.json`) so it's available in every project automatically — no per-project `.mcp.json` needed.
+
+## MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `search_session` | Search conversation history with recency bias. Pass `session_id` to scope to current session. |
+| `search_all_sessions` | Cross-session search, pure semantic. Optional git branch filter. |
+| `get_turns` | Retrieve conversation turns around a specific turn index. |
+| `get_session_stats` | Index statistics: turn count, session count, branches. |
+| `cleanup_sessions` | Delete old session data by age, session ID, or git branch. |
+
+### Example Usage (from Claude Code)
+
+```
+search_session("what was the approval workflow decision")
+search_session("error message from the deploy script", session_id="abc123...")
+search_all_sessions("authentication architecture", git_branch="develop")
+cleanup_sessions(max_age_days=60)
+```
+
+## Installation
+
+### Prerequisites
+
+- macOS with Apple Silicon (M1/M2/M3/M4)
+- Python 3.12+
+- Claude Code CLI
+
+### Step 1: Run Setup
+
+```bash
+cd /path/to/claude-code-session-rag
+./setup.sh
+```
+
+This creates a venv, installs dependencies (including watchdog), downloads the model, and installs hooks into `~/.claude/settings.json`.
+
+### Step 2: Restart Claude Code
+
+The setup script installs the MCP server globally and configures hooks automatically. Just restart Claude Code to activate.
+
+### How the Global MCP Config Works
+
+Setup adds the server to `~/.claude.json` at user scope with a `headersHelper` script that dynamically resolves the project root per session:
+
+```json
+{
+  "mcpServers": {
+    "session-rag": {
+      "type": "http",
+      "url": "http://127.0.0.1:7102/mcp/",
+      "headersHelper": "~/.claude/mcp-helpers/session-rag-headers.sh"
+    }
+  }
+}
+```
+
+The helper script (`~/.claude/mcp-helpers/session-rag-headers.sh`) runs at MCP connection time and outputs:
+
+```json
+{"X-Project-Root": "/path/to/current/git/repo"}
+```
+
+This means the server automatically knows which project each Claude Code session belongs to, without any per-project configuration.
+
+### What setup.sh installs
+
+**Global MCP server** in `~/.claude.json` (user scope):
+- HTTP MCP server at `http://127.0.0.1:7102/mcp/`
+- `headersHelper` at `~/.claude/mcp-helpers/session-rag-headers.sh` for dynamic project root detection
+
+**Hooks** in `~/.claude/settings.json` (merged safely with existing hooks):
+
+| Hook | What it does |
+|------|-------------|
+| **SessionStart** | Starts the server + registers file watcher + backfills missed sessions |
+| **Stop** | Indexes final turns when session ends |
+| **PreCompact** | Indexes turns before context compaction |
+
+## Architecture
+
+```
+Claude Code Session
+    │
+    ├── SessionStart hook ──► session-rag-server.sh start
+    │                     └──► session_start_hook.sh
+    │                           ├── sets $CLAUDE_SESSION_ID
+    │                           └── POST /watch (register watcher + backfill)
+    │
+    ├── [real-time] ────────── file_watcher.py (watchdog)
+    │                           watches ~/.claude/projects/{slug}/*.jsonl
+    │                           debounce 2s → parse new bytes → embed → index
+    │
+    ├── Stop hook ──────────► index_hook.py ──POST──► /index (final flush)
+    │
+    ├── PreCompact hook ────► index_hook.py ──POST──► /index
+    │
+    └── MCP tools ──────────────────────────────────► session-rag server
+                                                        │
+                                                        ├── transcript_parser.py
+                                                        │   (parse JSONL → turns)
+                                                        │
+                                                        ├── rag_engine.py
+                                                        │   (embed + Milvus)
+                                                        │
+                                                        └── ~/.session-rag/milvus.db
+                                                            (global vector DB)
+```
+
+### Indexing Pipeline
+
+1. **File watcher** (primary): watchdog monitors the transcript directory. When a `.jsonl` file is modified, the change is debounced (2s default) then the server reads from the last known byte offset to the end of file, parses new turns, and indexes them. Nothing is lost during debouncing — the byte offset ensures all content is captured.
+
+2. **Hook-based** (backup): Stop and PreCompact hooks POST to `/index` with the transcript path. Same incremental byte-offset logic. These serve as a safety net if the watcher misses something.
+
+3. **Backfill** (startup): On each SessionStart, the hook POSTs to `/watch` which scans all transcript files and indexes any that are behind their byte offset. This catches sessions missed due to server downtime.
+
+### What Gets Indexed
+
+- **User messages** with text content (not tool results)
+- **Assistant text responses** (not tool_use or thinking blocks)
+- **Compaction summaries** (session summary titles)
+
+### What Gets Skipped
+
+- Tool results, tool use blocks, thinking blocks
+- System messages, progress entries, file-history snapshots
+- Messages marked as `isMeta`
+
+### Incremental Indexing
+
+Each transcript is tracked by byte offset in `.session-rag/index_state.json`. Only new bytes since the last index are processed. The server owns this state file exclusively — no more race conditions from concurrent hook processes.
+
+### Auto-Expiry
+
+Turns older than 365 days are pruned automatically (checked once per day). Configure via the `SESSION_RAG_EXPIRE_DAYS` environment variable, or set to `0` to disable.
+
+## Configuration
+
+Environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SESSION_RAG_MODEL` | `embeddinggemma` | Embedding model: `embeddinggemma` or `modernbert` |
+| `SESSION_RAG_PORT` | `7102` | HTTP server port |
+| `SESSION_RAG_EXPIRE_DAYS` | `365` | Auto-prune turns older than this |
+| `SESSION_RAG_WATCH` | `true` | Enable/disable file watcher |
+| `SESSION_RAG_WATCH_DEBOUNCE` | `2.0` | Seconds to wait after last file change before indexing |
+
+### Switching Models
+
+Two embedding models are supported:
+
+| Model | ID | Dims | Context | Notes |
+|-------|----|------|---------|-------|
+| `modernbert` | `nomic-ai/modernbert-embed-base` | 768 | 8192 tokens | Default. Well-tested. |
+| `embeddinggemma` | `mlx-community/embeddinggemma-300m-bf16` | 768 | 2048 tokens | Google's EmbeddingGemma-300M. |
+
+To switch models:
+
+```bash
+# 1. Download the new model
+SESSION_RAG_MODEL=embeddinggemma ./download-model.sh
+
+# 2. Clear the existing index (vectors are incompatible across models)
+./venv/bin/python cleanup.py reset
+
+# 3. Restart the server with the new model
+export SESSION_RAG_MODEL=embeddinggemma
+./session-rag-server.sh restart
+```
+
+The server stamps `~/.session-rag/model_identity.json` with the active model. If you change `SESSION_RAG_MODEL` without clearing the index, the server will refuse to start with a clear error message.
+
+## Data Management
+
+### CLI Cleanup
+
+```bash
+# List all indexed sessions
+./venv/bin/python cleanup.py list /path/to/project
+
+# Delete turns older than 60 days
+./venv/bin/python cleanup.py expire /path/to/project --days 60
+
+# Delete a specific session
+./venv/bin/python cleanup.py delete /path/to/project --session abc123-...
+
+# Delete all turns from a branch
+./venv/bin/python cleanup.py delete /path/to/project --branch feature/old-branch
+
+# Full reset (drops everything)
+./venv/bin/python cleanup.py reset /path/to/project
+
+# Show stats
+./venv/bin/python cleanup.py stats /path/to/project
+```
+
+### MCP Cleanup Tool
+
+From within a Claude Code session:
+```
+cleanup_sessions(max_age_days=60)
+cleanup_sessions(git_branch="feature/old-branch")
+cleanup_sessions(session_id="abc123-...")
+```
+
+## Server Management
+
+```bash
+./session-rag-server.sh start    # Start (idempotent)
+./session-rag-server.sh stop     # Stop
+./session-rag-server.sh status   # Check if running
+./session-rag-server.sh restart  # Stop + start
+```
+
+Health check (includes watcher status):
+```bash
+curl http://127.0.0.1:7102/health
+```
+
+Logs: `~/.session-rag/server.log`
+PID: `~/.session-rag/server.pid`
+
+## File Structure
+
+```
+claude-code-session-rag/
+├── http_server.py          # HTTP MCP server (port 7102)
+├── file_watcher.py         # Watchdog-based transcript file watcher
+├── tools.py                # MCP tool definitions
+├── rag_engine.py           # Embedding (ModernBERT/EmbeddingGemma) + Milvus operations
+├── transcript_parser.py    # Parse JSONL transcripts into turns
+├── index_hook.py           # Hook entry point (stdin → POST)
+├── session_start_hook.sh   # SessionStart hook (env var + register watcher)
+├── cleanup.py              # CLI data management tool
+├── session-rag-server.sh   # Server lifecycle script
+├── setup.sh                # Installation script (installs hooks too)
+├── download-model.sh       # Model download helper
+├── requirements.txt        # Python dependencies
+└── README.md
+```
+
+Runtime files:
+```
+~/.claude.json                      # Global MCP server config (user scope)
+~/.claude/settings.json             # Hooks (installed by setup.sh)
+~/.claude/mcp-helpers/session-rag-headers.sh  # Dynamic header helper
+~/.session-rag/server.pid           # Server PID
+~/.session-rag/server.log           # Server logs
+~/.session-rag/milvus.db            # Global vector DB
+~/.session-rag/index_state.json     # Indexing progress (byte offsets)
+```
