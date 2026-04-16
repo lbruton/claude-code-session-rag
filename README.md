@@ -8,7 +8,7 @@ SessionFlow watches your Claude Code session transcripts, embeds them with a loc
 
 ## Architecture
 
-```
+```text
 Claude Code terminals (6-8 concurrent)
     ↓ POST /mcp (MCP StreamableHTTP)
 SessionFlow HTTP server (port 7102)
@@ -36,7 +36,7 @@ SessionFlow HTTP server (port 7102)
 
 ### Search examples
 
-```
+```text
 search_all_sessions("deployment decisions", date_from="2026-04-08", date_to="2026-04-08")
 search_all_sessions("what broke in production", date_from="2026-04-01")
 search_session("the milvus migration", session_id="<CLAUDE_SESSION_ID>")

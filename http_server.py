@@ -331,7 +331,7 @@ async def lifespan(app: Starlette):
 mcp_server = Server(
     "sessionflow",
     instructions=(
-        "Session-RAG provides semantic search over Claude Code conversation history. "
+        "SessionFlow provides semantic search over Claude Code conversation history. "
         "When using search_session, ALWAYS pass the session_id parameter using the "
         "CLAUDE_SESSION_ID environment variable to filter results to the current session. "
         "Auto-resolution of session ID is not supported via HTTP headers. "

@@ -212,10 +212,10 @@ def main():
     source.close()
     target.close()
 
-    print(f"\nNext steps:")
+    print("\nNext steps:")
     print(f"  1. export SESSIONFLOW_MILVUS_URI={args.target}")
-    print(f"  2. ./sessionflow-server.sh restart")
-    print(f"  3. curl http://127.0.0.1:7102/health  # verify milvus_backend=standalone")
+    print("  2. ./sessionflow-server.sh restart")
+    print("  3. curl http://127.0.0.1:7102/health  # verify milvus_backend=standalone")
 
 
 if __name__ == "__main__":

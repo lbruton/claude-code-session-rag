@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "======================================================================"
-echo "Session-RAG Setup for Apple Silicon Mac"
+echo "SessionFlow Setup for Apple Silicon Mac"
 echo "======================================================================"
 echo ""
 
