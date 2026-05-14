@@ -19,9 +19,17 @@ import pytest
 
 
 def _run_status(script_path, home_dir, port=19999, timeout=10):
-    """Run 'sessionflow-server.sh status' with overridden HOME and PORT.
-
-    Returns (exit_code, stderr_output).
+    """
+    Invoke the sessionflow server script's `status` command with `HOME` and `SESSIONFLOW_PORT` overridden.
+    
+    Parameters:
+        script_path (str): Path to the `sessionflow-server.sh` script to execute.
+        home_dir (str | pathlib.Path): Directory to use as the `HOME` environment variable.
+        port (int): Value to set for the `SESSIONFLOW_PORT` environment variable.
+        timeout (int | float): Seconds to wait for the subprocess before raising a timeout.
+    
+    Returns:
+        (int, str): A tuple containing the process exit code and the captured stderr output.
     """
     env = os.environ.copy()
     env["HOME"] = str(home_dir)
@@ -37,7 +45,12 @@ def _run_status(script_path, home_dir, port=19999, timeout=10):
 
 
 def _find_free_port():
-    """Find a free TCP port."""
+    """
+    Return an ephemeral free TCP port bound to 127.0.0.1.
+    
+    Returns:
+        port (int): A currently unused TCP port number selected by the OS.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
@@ -90,6 +103,11 @@ class TestIsRunningStaleHeartbeatPortOpen:
         self, tmp_path, mock_pid_file, stale_heartbeat_file, script_path
     ):
         # Start a temporary TCP listener on a random port.
+        """
+        Verify that `is_running` reports the server as running when the heartbeat file is stale but the configured TCP port is accepting connections.
+        
+        This test starts a temporary TCP listener on a free port, invokes the script's `status` command with that port and a stale heartbeat, and asserts the process exit code is 0 (server considered running).
+        """
         port = _find_free_port()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -112,6 +130,11 @@ class TestWatchdogNoRestartFreshHeartbeat:
         self, tmp_path, mock_pid_file, mock_heartbeat_file, script_path, tmp_server_dir
     ):
         # Create the log file so we can check for restart messages.
+        """
+        Verify the watchdog does not trigger a restart when the heartbeat is fresh.
+        
+        Runs the script's `status` check under a fresh-heartbeat fixture, asserts the status exit code indicates the server is running, and confirms `server.log` contains no "restart" messages.
+        """
         log_file = tmp_server_dir / "server.log"
         log_file.write_text("")
 

@@ -66,12 +66,31 @@ class HeartbeatThread:
     """
 
     def __init__(self, path: Path, interval: float = 30.0):
+        """
+        Initialize a HeartbeatThread that periodically writes a JSON heartbeat to the given file.
+        
+        Parameters:
+            path (Path): Destination file path where heartbeat JSON will be written.
+            interval (float): Seconds between heartbeat writes (defaults to 30.0). The thread will attempt a write at this interval.
+        
+        Detailed behavior:
+            - Creates an internal stop event used to signal the background thread to exit.
+            - Initializes the thread placeholder; the background thread is started by calling start().
+        """
         self._path = path
         self._interval = interval
         self._stop_event = threading.Event()
         self._thread = None
 
     def _get_activity(self) -> str:
+        """
+        Return the current file-watcher activity label.
+        
+        Queries the global file watcher status and returns "processing" if the watcher reports active processing; on any error or if not processing, returns "idle".
+        
+        Returns:
+            activity (str): "processing" if the watcher is processing, "idle" otherwise.
+        """
         try:
             status = file_watcher.get_watcher_status()
             if status.get('global', {}).get('processing', False):
@@ -81,6 +100,11 @@ class HeartbeatThread:
         return "idle"
 
     def _write_heartbeat(self):
+        """
+        Write the heartbeat JSON file to the configured path using an atomic replace.
+        
+        The file contains `timestamp` (current epoch time), `pid` (current process id), and `activity` (value from `_get_activity()`). Data is written to a temporary file in the target directory and then moved into place with `os.replace`. Failures are caught and logged as a warning.
+        """
         data = {
             "timestamp": time.time(),
             "pid": os.getpid(),
@@ -94,15 +118,30 @@ class HeartbeatThread:
             logger.warning("Heartbeat write failed: %s", e)
 
     def _run(self):
+        """
+        Run the thread's main loop, writing the heartbeat file periodically until stopped.
+        
+        This method repeatedly writes a heartbeat and then waits for the configured interval (or until a stop is requested). It exits when the thread's stop event is set.
+        """
         while not self._stop_event.is_set():
             self._write_heartbeat()
             self._stop_event.wait(self._interval)
 
     def start(self):
+        """
+        Start the heartbeat background thread.
+        
+        Initiates a daemon thread that runs the heartbeat loop until the thread is stopped via stop().
+        """
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self):
+        """
+        Signal the heartbeat thread to stop and wait briefly for it to finish.
+        
+        If the heartbeat thread was started, this sets the stop event and blocks up to 2 seconds for the thread to join. If the thread was not started, this returns immediately.
+        """
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
@@ -316,7 +355,13 @@ async def watch_endpoint(request: Request) -> JSONResponse:
 
 @contextlib.asynccontextmanager
 async def lifespan(app: Starlette):
-    """Server lifecycle: PID file, model preload, server mode init."""
+    """
+    Manage server startup and shutdown tasks for the Starlette application.
+    
+    On startup: ensure the server directory exists, write the PID file, attempt to preload the embedding model and initialize server mode for the shared Milvus backend, start a periodic heartbeat thread, schedule a background full-text-search backfill, and start the global file watcher (which may schedule its own backfill). The context yields control while the server is running.
+    
+    On shutdown: stop the heartbeat thread and remove the heartbeat file only if it was written by this process, stop the global file watcher, close server mode, remove the PID file, and perform any remaining cleanup.
+    """
     _SERVER_DIR.mkdir(parents=True, exist_ok=True)
 
     PID_FILE.write_text(str(os.getpid()))
@@ -348,6 +393,11 @@ async def lifespan(app: Starlette):
     # Backfill FTS from Milvus for any records indexed before FTS was added.
     # Runs as a background task so it doesn't block HTTP server binding.
     async def _fts_backfill():
+        """
+        Trigger a full-text-search backfill on the configured Milvus database shortly after startup.
+        
+        This coroutine waits briefly to allow the HTTP server to bind, runs rag_engine.backfill_fts(db_path=db_path) in a threadpool, writes a short summary to stderr if records were backfilled, and writes a warning to stderr on failure.
+        """
         await asyncio.sleep(1)  # Let HTTP server bind first
         try:
             loop = asyncio.get_event_loop()

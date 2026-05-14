@@ -88,6 +88,14 @@ class TestHeartbeatIncludesActivity:
     """Heartbeat JSON includes activity field."""
 
     def test_heartbeat_includes_activity(self, tmp_server_dir):
+        """
+        Test that the heartbeat payload contains an `activity` field with an allowed value.
+        
+        Asserts the heartbeat file written by HeartbeatThread includes an "activity" key and that its value is either "idle" or "processing".
+        
+        Parameters:
+            tmp_server_dir (pathlib.Path): Temporary directory used as the server directory where the heartbeat file is created.
+        """
         HeartbeatThread = _get_heartbeat_thread()
         hb_path = tmp_server_dir / "heartbeat"
         thread = HeartbeatThread(path=hb_path, interval=0.5)

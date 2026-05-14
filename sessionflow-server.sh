@@ -23,6 +23,7 @@ HEARTBEAT_FILE="$SERVER_DIR/heartbeat"
 
 mkdir -p "$SERVER_DIR"
 
+# is_heartbeat_fresh determines whether HEARTBEAT_FILE and PID_FILE exist and whether the heartbeat's `timestamp` is within WATCHDOG_STALE_THRESHOLD seconds and its `pid` matches the PID stored in PID_FILE. Exits with status 0 if the heartbeat is fresh and matches the expected PID, non-zero otherwise.
 is_heartbeat_fresh() {
     if [ ! -f "$HEARTBEAT_FILE" ] || [ ! -f "$PID_FILE" ]; then
         return 1
@@ -41,6 +42,7 @@ except Exception:
 " "$HEARTBEAT_FILE" "$WATCHDOG_STALE_THRESHOLD" "$expected_pid"
 }
 
+# is_running checks whether the server recorded in PID_FILE is alive and either has a fresh heartbeat or accepts TCP connections on the configured PORT.
 is_running() {
     if [ -f "$PID_FILE" ]; then
         local pid
@@ -74,6 +76,7 @@ stop_watchdog() {
     fi
 }
 
+# start_watchdog launches a background watchdog that monitors heartbeat freshness and, after repeated stale detections, kills and restarts the server process and any stale port holders.
 start_watchdog() {
     stop_watchdog
 

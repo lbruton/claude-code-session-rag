@@ -14,7 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 @pytest.fixture
 def tmp_server_dir(tmp_path):
-    """Create a temporary directory mimicking ~/.sessionflow/."""
+    """
+    Create a temporary `.sessionflow` directory under the provided `tmp_path`.
+    
+    Returns:
+        pathlib.Path: Path to the created `.sessionflow` directory.
+    """
     server_dir = tmp_path / ".sessionflow"
     server_dir.mkdir()
     return server_dir
@@ -22,7 +27,15 @@ def tmp_server_dir(tmp_path):
 
 @pytest.fixture
 def mock_heartbeat_file(tmp_server_dir):
-    """Write a fresh heartbeat JSON file."""
+    """
+    Create a heartbeat JSON file with the current timestamp, current process PID, and activity "idle" inside the provided server directory.
+    
+    Parameters:
+        tmp_server_dir (pathlib.Path): Directory in which to create the `heartbeat` file.
+    
+    Returns:
+        pathlib.Path: Path to the created `heartbeat` file.
+    """
     hb_path = tmp_server_dir / "heartbeat"
     data = {
         "timestamp": time.time(),
@@ -35,7 +48,15 @@ def mock_heartbeat_file(tmp_server_dir):
 
 @pytest.fixture
 def stale_heartbeat_file(tmp_server_dir):
-    """Write a heartbeat with timestamp 300 seconds in the past."""
+    """
+    Create a heartbeat file with its timestamp set 300 seconds in the past.
+    
+    Parameters:
+        tmp_server_dir (pathlib.Path): Directory in which to create the `heartbeat` file.
+    
+    Returns:
+        pathlib.Path: Path to the created `heartbeat` file containing JSON with keys `timestamp` (float), `pid` (int), and `activity` (str).
+    """
     hb_path = tmp_server_dir / "heartbeat"
     data = {
         "timestamp": time.time() - 300,
@@ -48,7 +69,15 @@ def stale_heartbeat_file(tmp_server_dir):
 
 @pytest.fixture
 def mock_pid_file(tmp_server_dir):
-    """Write a PID file with current PID."""
+    """
+    Create a server PID file named `server.pid` inside the given directory containing the current process PID.
+    
+    Parameters:
+        tmp_server_dir (pathlib.Path): Directory in which to create the `server.pid` file.
+    
+    Returns:
+        pathlib.Path: Path to the created `server.pid` file.
+    """
     pid_path = tmp_server_dir / "server.pid"
     pid_path.write_text(str(os.getpid()))
     return pid_path
@@ -56,5 +85,10 @@ def mock_pid_file(tmp_server_dir):
 
 @pytest.fixture
 def script_path():
-    """Return the absolute path to sessionflow-server.sh."""
+    """
+    Compute the absolute filesystem path to the `sessionflow-server.sh` script located at the project root.
+    
+    Returns:
+        script_path (str): Absolute path to `sessionflow-server.sh`.
+    """
     return str(Path(__file__).resolve().parent.parent / "sessionflow-server.sh")
