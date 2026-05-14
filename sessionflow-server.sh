@@ -24,17 +24,21 @@ HEARTBEAT_FILE="$SERVER_DIR/heartbeat"
 mkdir -p "$SERVER_DIR"
 
 is_heartbeat_fresh() {
-    if [ ! -f "$HEARTBEAT_FILE" ]; then
+    if [ ! -f "$HEARTBEAT_FILE" ] || [ ! -f "$PID_FILE" ]; then
         return 1
     fi
-    python3 -c "
+    local expected_pid
+    expected_pid=$(cat "$PID_FILE")
+    "$PYTHON" -c "
 import json, time, sys
 try:
     h = json.load(open(sys.argv[1]))
-    sys.exit(0 if time.time() - h['timestamp'] < float(sys.argv[2]) else 1)
+    age_ok = (time.time() - h['timestamp']) < float(sys.argv[2])
+    pid_ok = str(h.get('pid')) == sys.argv[3]
+    sys.exit(0 if age_ok and pid_ok else 1)
 except Exception:
     sys.exit(1)
-" "$HEARTBEAT_FILE" "$WATCHDOG_STALE_THRESHOLD"
+" "$HEARTBEAT_FILE" "$WATCHDOG_STALE_THRESHOLD" "$expected_pid"
 }
 
 is_running() {

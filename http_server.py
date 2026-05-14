@@ -86,7 +86,7 @@ class HeartbeatThread:
             "pid": os.getpid(),
             "activity": self._get_activity(),
         }
-        tmp_path = self._path.parent / ".heartbeat.tmp"
+        tmp_path = self._path.parent / f".heartbeat.{os.getpid()}.tmp"
         try:
             tmp_path.write_text(json.dumps(data))
             os.replace(str(tmp_path), str(self._path))
