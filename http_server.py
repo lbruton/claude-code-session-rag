@@ -379,7 +379,12 @@ async def lifespan(app: Starlette):
 
     heartbeat.stop()
     if HEARTBEAT_FILE.exists():
-        HEARTBEAT_FILE.unlink()
+        try:
+            data = json.loads(HEARTBEAT_FILE.read_text())
+            if data.get("pid") == os.getpid():
+                HEARTBEAT_FILE.unlink()
+        except Exception:
+            pass
 
     await file_watcher.stop_global_watcher()
     rag_engine.close_server_mode()
