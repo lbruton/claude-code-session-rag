@@ -18,15 +18,43 @@ HEALTH_URL="http://127.0.0.1:$PORT/health"
 MAX_WAIT=60
 WATCHDOG_INTERVAL=30
 WATCHDOG_MAX_FAILURES=3
+WATCHDOG_STALE_THRESHOLD=120
+HEARTBEAT_FILE="$SERVER_DIR/heartbeat"
 
 mkdir -p "$SERVER_DIR"
 
+# is_heartbeat_fresh determines whether HEARTBEAT_FILE and PID_FILE exist and whether the heartbeat's `timestamp` is within WATCHDOG_STALE_THRESHOLD seconds and its `pid` matches the PID stored in PID_FILE. Exits with status 0 if the heartbeat is fresh and matches the expected PID, non-zero otherwise.
+is_heartbeat_fresh() {
+    if [ ! -f "$HEARTBEAT_FILE" ] || [ ! -f "$PID_FILE" ]; then
+        return 1
+    fi
+    local expected_pid
+    expected_pid=$(cat "$PID_FILE")
+    "$PYTHON" -c "
+import json, time, sys
+try:
+    h = json.load(open(sys.argv[1]))
+    age_ok = (time.time() - h['timestamp']) < float(sys.argv[2])
+    pid_ok = str(h.get('pid')) == sys.argv[3]
+    sys.exit(0 if age_ok and pid_ok else 1)
+except Exception:
+    sys.exit(1)
+" "$HEARTBEAT_FILE" "$WATCHDOG_STALE_THRESHOLD" "$expected_pid"
+}
+
+# is_running checks whether the server recorded in PID_FILE is alive and either has a fresh heartbeat or accepts TCP connections on the configured PORT.
 is_running() {
     if [ -f "$PID_FILE" ]; then
         local pid
         pid=$(cat "$PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
-            if curl -sf --max-time 2 "$HEALTH_URL" >/dev/null 2>&1; then
+            # Process alive — check heartbeat or TCP fallback
+            if is_heartbeat_fresh; then
+                return 0
+            fi
+            # TCP fallback: prevents double-start during startup before first heartbeat.
+            # Intentionally more lenient than the watchdog (which uses heartbeat-only).
+            if (echo >/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then
                 return 0
             fi
             return 1
@@ -48,6 +76,7 @@ stop_watchdog() {
     fi
 }
 
+# start_watchdog launches a background watchdog that monitors heartbeat freshness and, after repeated stale detections, kills and restarts the server process and any stale port holders.
 start_watchdog() {
     stop_watchdog
 
@@ -56,11 +85,26 @@ start_watchdog() {
         while true; do
             sleep "$WATCHDOG_INTERVAL"
 
-            if curl -sf --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
+            if is_heartbeat_fresh; then
                 failures=0
             else
-                failures=$((failures + 1))
-                echo "[sessionflow-watchdog] Health check failed ($failures/$WATCHDOG_MAX_FAILURES)" >> "$LOG_FILE"
+                # Heartbeat stale — check if process is actually dead
+                if [ -f "$PID_FILE" ]; then
+                    local pid
+                    pid=$(cat "$PID_FILE")
+                    if kill -0 "$pid" 2>/dev/null; then
+                        # Process alive but heartbeat stale — suspect hang
+                        failures=$((failures + 1))
+                        echo "[sessionflow-watchdog] Heartbeat stale, process alive — suspect hang ($failures/$WATCHDOG_MAX_FAILURES)" >> "$LOG_FILE"
+                    else
+                        # Process dead
+                        failures=$((failures + 1))
+                        echo "[sessionflow-watchdog] Heartbeat stale, process dead ($failures/$WATCHDOG_MAX_FAILURES)" >> "$LOG_FILE"
+                    fi
+                else
+                    failures=$((failures + 1))
+                    echo "[sessionflow-watchdog] No PID file ($failures/$WATCHDOG_MAX_FAILURES)" >> "$LOG_FILE"
+                fi
             fi
 
             if [ "$failures" -ge "$WATCHDOG_MAX_FAILURES" ]; then
@@ -91,7 +135,7 @@ start_watchdog() {
                 [ -n "${SESSIONFLOW_MILVUS_URI:-}" ] && export SESSIONFLOW_MILVUS_URI
                 nohup "$PYTHON" -u "$SCRIPT_DIR/http_server.py" >> "$LOG_FILE" 2>&1 &
 
-                # Wait for it to be healthy
+                # Wait for it to be healthy (HTTP check is fine during startup — no embedding load)
                 local waited=0
                 while [ $waited -lt $MAX_WAIT ]; do
                     sleep 1
