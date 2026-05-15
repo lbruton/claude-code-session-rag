@@ -27,6 +27,7 @@ from pymilvus import MilvusClient, DataType, CollectionSchema, FieldSchema
 from mlx_embeddings.utils import load as mlx_load, generate as mlx_generate
 import mlx.core as mx
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional
 import asyncio
 import logging
@@ -188,15 +189,21 @@ _persistent_clients: Dict[str, MilvusClient] = {}
 _fts = FTSIndex("turns_fts", ["session_id", "git_branch", "turn_index", "timestamp", "chunk_type", "project_root"])
 _write_lock: Optional[asyncio.Lock] = None
 _embed_semaphore: Optional[asyncio.Semaphore] = None
+# Dedicated single-worker executor so every MLX/Metal call runs on the same OS
+# thread. The asyncio semaphore already serializes calls in time, but the
+# default executor can rotate workers between calls — and MLX command-buffer
+# state is not safe to migrate across threads. See SESF-8.
+_embed_executor: Optional[ThreadPoolExecutor] = None
 _server_mode = False
 
 
 def init_server_mode(db_path: Optional[str] = None):
     """Initialize async concurrency primitives for HTTP server mode."""
-    global _write_lock, _embed_semaphore, _server_mode
+    global _write_lock, _embed_semaphore, _embed_executor, _server_mode
     _check_model_identity(db_path=db_path)
     _write_lock = asyncio.Lock()
     _embed_semaphore = asyncio.Semaphore(1)
+    _embed_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx-embed")
     _server_mode = True
     _fts.set_server_mode(True)
     print(f"Server mode initialized (model: {_MODEL_NAME})", file=sys.stderr)
@@ -204,7 +211,7 @@ def init_server_mode(db_path: Optional[str] = None):
 
 def close_server_mode():
     """Close all persistent clients (Milvus + FTS) and reset server mode."""
-    global _write_lock, _embed_semaphore, _server_mode
+    global _write_lock, _embed_semaphore, _embed_executor, _server_mode
     for path, client in list(_persistent_clients.items()):
         try:
             client.close()
@@ -213,6 +220,9 @@ def close_server_mode():
             logger.warning("Error closing Milvus client %s: %s", path, e)
     _persistent_clients.clear()
     _fts.close_all()
+    if _embed_executor is not None:
+        _embed_executor.shutdown(wait=True)
+        _embed_executor = None
     _write_lock = None
     _embed_semaphore = None
     _server_mode = False
@@ -932,7 +942,7 @@ async def search_async(query: str, n: int = 5, session_id: Optional[str] = None,
     if _embed_semaphore is not None:
         async with _embed_semaphore:
             return await loop.run_in_executor(
-                None, lambda: search(query, n, session_id, git_branch, project_root, recency_boost, db_path))
+                _embed_executor, lambda: search(query, n, session_id, git_branch, project_root, recency_boost, db_path))
     else:
         return await loop.run_in_executor(
             None, lambda: search(query, n, session_id, git_branch, project_root, recency_boost, db_path))
@@ -945,6 +955,6 @@ async def add_turns_async(turns: List[Dict], db_path: Optional[str] = None) -> i
     if _embed_semaphore is not None and _write_lock is not None:
         async with _embed_semaphore:
             async with _write_lock:
-                return await loop.run_in_executor(None, lambda: add_turns(turns, db_path))
+                return await loop.run_in_executor(_embed_executor, lambda: add_turns(turns, db_path))
     else:
         return await loop.run_in_executor(None, lambda: add_turns(turns, db_path))
