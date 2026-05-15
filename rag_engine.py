@@ -220,11 +220,14 @@ def close_server_mode():
             logger.warning("Error closing Milvus client %s: %s", path, e)
     _persistent_clients.clear()
     _fts.close_all()
+    # Nil the semaphore and lock FIRST so any coroutine that wakes up while we
+    # are shutting down sees None and takes the CLI fallback path instead of
+    # trying to enqueue work onto a torn-down executor.
+    _embed_semaphore = None
+    _write_lock = None
     if _embed_executor is not None:
         _embed_executor.shutdown(wait=True)
         _embed_executor = None
-    _write_lock = None
-    _embed_semaphore = None
     _server_mode = False
 
 
@@ -938,11 +941,16 @@ async def search_async(query: str, n: int = 5, session_id: Optional[str] = None,
                        db_path: Optional[str] = None) -> List[Dict]:
     """Async search with embed semaphore."""
     loop = asyncio.get_event_loop()
+    # Snapshot globals at function entry (before any await) to close the TOCTOU
+    # window: close_server_mode can clear _embed_executor between the semaphore
+    # guard and the run_in_executor call.
+    executor = _embed_executor
+    semaphore = _embed_semaphore
 
-    if _embed_semaphore is not None:
-        async with _embed_semaphore:
+    if semaphore is not None:
+        async with semaphore:
             return await loop.run_in_executor(
-                _embed_executor, lambda: search(query, n, session_id, git_branch, project_root, recency_boost, db_path))
+                executor, lambda: search(query, n, session_id, git_branch, project_root, recency_boost, db_path))
     else:
         return await loop.run_in_executor(
             None, lambda: search(query, n, session_id, git_branch, project_root, recency_boost, db_path))
@@ -951,10 +959,16 @@ async def search_async(query: str, n: int = 5, session_id: Optional[str] = None,
 async def add_turns_async(turns: List[Dict], db_path: Optional[str] = None) -> int:
     """Async add_turns with embed semaphore + write lock."""
     loop = asyncio.get_event_loop()
+    # Snapshot globals at function entry (before any await) to close the TOCTOU
+    # window: close_server_mode can clear _embed_executor between the semaphore
+    # guard and the run_in_executor call.
+    executor = _embed_executor
+    semaphore = _embed_semaphore
+    write_lock = _write_lock
 
-    if _embed_semaphore is not None and _write_lock is not None:
-        async with _embed_semaphore:
-            async with _write_lock:
-                return await loop.run_in_executor(_embed_executor, lambda: add_turns(turns, db_path))
+    if semaphore is not None and write_lock is not None:
+        async with semaphore:
+            async with write_lock:
+                return await loop.run_in_executor(executor, lambda: add_turns(turns, db_path))
     else:
         return await loop.run_in_executor(None, lambda: add_turns(turns, db_path))
