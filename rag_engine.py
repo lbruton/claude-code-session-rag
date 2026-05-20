@@ -677,29 +677,32 @@ def get_stats(project_root: Optional[str] = None, db_path: Optional[str] = None)
 def _query_all(output_fields: list, batch_size: int = 1000,
                filter_expr: Optional[str] = None,
                db_path: Optional[str] = None) -> list:
-    """Query all rows with offset pagination. Optional filter expression."""
-    MILVUS_MAX = 16384
+    """Query all rows via Milvus query_iterator. Optional filter expression.
+
+    Uses pymilvus's server-side iterator instead of offset pagination so the
+    full collection is drained regardless of size. The previous implementation
+    hard-capped at 16,384 rows, silently truncating any collection larger than
+    that — see SESF-4.
+    """
     all_results = []
-    offset = 0
 
     with milvus_client(db_path) as client:
         if not client.has_collection(COLLECTION_NAME):
             return []
-        while offset < MILVUS_MAX:
-            effective_limit = min(batch_size, MILVUS_MAX - offset)
-            batch = client.query(
-                collection_name=COLLECTION_NAME,
-                filter=filter_expr or "",
-                limit=effective_limit,
-                offset=offset,
-                output_fields=output_fields,
-            )
-            if not batch:
-                break
-            all_results.extend(batch)
-            if len(batch) < effective_limit:
-                break
-            offset += effective_limit
+        iterator = client.query_iterator(
+            collection_name=COLLECTION_NAME,
+            batch_size=batch_size,
+            filter=filter_expr or "",
+            output_fields=output_fields,
+        )
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                all_results.extend(batch)
+        finally:
+            iterator.close()
 
     return all_results
 
@@ -841,11 +844,13 @@ def backfill_fts(db_path: Optional[str] = None) -> int:
         if not missing_doc_ids:
             return 0
 
-        # Pass 2: hydrate missing rows in small batches.
+        # Pass 2: hydrate missing rows in small batches and stream into FTS
+        # one batch at a time so peak memory stays at O(BATCH_FETCH) regardless
+        # of how many rows are missing — see SESF-5.
         output_fields = ["doc_id", "document", "session_id", "git_branch",
                          "turn_index", "timestamp", "chunk_type", "project_root"]
         BATCH_FETCH = 100
-        records = []
+        inserted = 0
         with milvus_client(db_path) as client:
             for i in range(0, len(missing_doc_ids), BATCH_FETCH):
                 chunk = missing_doc_ids[i:i + BATCH_FETCH]
@@ -856,8 +861,8 @@ def backfill_fts(db_path: Optional[str] = None) -> int:
                     limit=len(chunk),
                     output_fields=output_fields,
                 )
-                for r in batch:
-                    records.append({
+                records = [
+                    {
                         "doc_id": r["doc_id"],
                         "content": r.get("document", ""),
                         "session_id": r.get("session_id", ""),
@@ -866,13 +871,15 @@ def backfill_fts(db_path: Optional[str] = None) -> int:
                         "timestamp": r.get("timestamp", ""),
                         "chunk_type": r.get("chunk_type", "turn"),
                         "project_root": r.get("project_root", ""),
-                    })
+                    }
+                    for r in batch
+                ]
+                if records:
+                    _fts.insert(fts_conn, records)
+                    inserted += len(records)
 
-        if records:
-            _fts.insert(fts_conn, records)
-
-        logger.info("FTS backfill: inserted %d records", len(records))
-        return len(records)
+        logger.info("FTS backfill: inserted %d records", inserted)
+        return inserted
     finally:
         _fts.close_ephemeral(fts_conn)
 
