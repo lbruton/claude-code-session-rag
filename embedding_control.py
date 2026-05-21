@@ -127,9 +127,13 @@ class EmbeddingBudget:
         return [turns[i:i + self.batch_size] for i in range(0, len(turns), self.batch_size)]
 
     def status(self) -> dict:
+        try:
+            model_name = EmbeddingIdentity.current_local().model_name
+        except ValueError:
+            model_name = "unknown"
         return {
             "embedding_provider": "local_mlx",
-            "model_name": EmbeddingIdentity.current_local().model_name,
+            "model_name": model_name,
             "batch_size": self.batch_size,
             "cooldown_ms": self.cooldown_ms,
             "max_turns_per_run": self.max_turns_per_run,

@@ -17,6 +17,25 @@ from provider_adapters import (
 )
 
 
+def _content_to_text(content) -> str:
+    """Extract recall-safe text from Codex content shapes."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                if text:
+                    parts.append(str(text))
+            elif item:
+                parts.append(str(item))
+        return "\n".join(parts)
+    if content:
+        return str(content)
+    return ""
+
+
 class CodexAdapter:
     provider = "codex"
     source_kind = "codex_rollout_jsonl"
@@ -46,14 +65,32 @@ class CodexAdapter:
                         entry = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
                     logical_session_id = (
                         entry.get("session_id")
                         or entry.get("sessionId")
                         or entry.get("id")
+                        or payload.get("session_id")
+                        or payload.get("sessionId")
+                        or payload.get("id")
                         or logical_session_id
                     )
-                    project_root = entry.get("cwd") or entry.get("project_root") or project_root
-                    timestamp = entry.get("timestamp") or entry.get("created_at") or timestamp
+                    git = payload.get("git") if isinstance(payload.get("git"), dict) else {}
+                    project_root = (
+                        entry.get("cwd")
+                        or entry.get("project_root")
+                        or payload.get("cwd")
+                        or payload.get("project_root")
+                        or git.get("cwd")
+                        or project_root
+                    )
+                    timestamp = (
+                        entry.get("timestamp")
+                        or entry.get("created_at")
+                        or payload.get("timestamp")
+                        or payload.get("created_at")
+                        or timestamp
+                    )
                     if project_root and timestamp:
                         break
         except OSError:
@@ -120,8 +157,10 @@ class CodexAdapter:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                role = entry.get("role")
-                content = entry.get("content") or entry.get("text") or ""
+                payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+                record = payload if payload else entry
+                role = record.get("role")
+                content = _content_to_text(record.get("content") or record.get("text") or "")
                 if role == "user" and content:
                     pending_user = str(content)
                     continue
@@ -150,8 +189,8 @@ class CodexAdapter:
                         "source_path": path,
                         "transcript_file": Path(path).name,
                         "turn_index": index,
-                        "timestamp": entry.get("timestamp", source.timestamp),
-                        "git_branch": entry.get("git_branch", ""),
+                        "timestamp": entry.get("timestamp") or record.get("timestamp") or source.timestamp,
+                        "git_branch": entry.get("git_branch") or record.get("git_branch", ""),
                         "chunk_type": "turn",
                         "project_root": source.project_root,
                     })

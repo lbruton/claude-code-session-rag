@@ -41,6 +41,7 @@ from provider_antigravity import AntigravityAdapter
 from provider_claude import ClaudeCodeCliAdapter, ClaudeDesktopCoworkProbe
 from provider_codex import CodexAdapter
 from provider_opencode import OpenCodeAdapter
+from provider_ingestion import ProviderIngestionService, process_startup_provider_backfill
 from file_watcher import register_project, get_global_watcher
 from tools import register_tools, set_current_project_root
 
@@ -502,9 +503,22 @@ async def lifespan(app: Starlette):
     try:
         watcher = await file_watcher.start_global_watcher(db_path)
         if watcher:
-            # Full backfill across all projects in background
-            # Delay lets HTTP server finish binding before embedding work starts
-            asyncio.create_task(watcher.backfill(startup_delay=3))
+            enabled_providers = [
+                "claude_code_cli",
+                "codex",
+                "opencode",
+                "antigravity_cli",
+                "antigravity_desktop",
+            ]
+            mode = get_embedding_budget().mode
+            # Delay lets HTTP server finish binding before bounded provider work starts.
+            asyncio.create_task(process_startup_provider_backfill(
+                _backfill_manager,
+                db_path,
+                enabled_providers=enabled_providers,
+                mode=mode,
+                startup_delay=3,
+            ))
     except Exception as e:
         print(f"[HTTP] Warning: Global watcher start failed: {e}", file=sys.stderr)
 

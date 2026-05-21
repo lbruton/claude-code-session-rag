@@ -273,8 +273,8 @@ write_launch_agent_plist() {
     <!-- EnvironmentVariables: HOME + PATH only. Custom SessionFlow env
          (SESSIONFLOW_MILVUS_URI, SESSIONFLOW_PORT, etc.) is NOT propagated
          here because launchd does not inherit shell env. To set them under
-         the LaunchAgent: either (a) run `launchctl setenv <KEY> <VAL>` once
-         before `install-agent`, or (b) hand-edit this plist and add the
+         the LaunchAgent: either (a) run \`launchctl setenv <KEY> <VAL>\` once
+         before \`install-agent\`, or (b) hand-edit this plist and add the
          keys below the PATH entry. -->
     <key>EnvironmentVariables</key>
     <dict>

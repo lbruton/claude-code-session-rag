@@ -81,7 +81,7 @@ class AntigravityAdapter:
         source: ProviderSource,
         cursor: Optional[Dict],
     ) -> ProviderParseResult:
-        last_step = int((cursor or {}).get("last_step_index", 0))
+        last_step = int((cursor or {}).get("last_step_index", -1))
         emitted = set((cursor or {}).get("emitted_ids", []))
         turns = []
         try:
@@ -98,7 +98,11 @@ class AntigravityAdapter:
             # cursor provenance is shared (e.g. resumed conversation with a
             # rewritten transcript). Revisit cursor scoping once we have
             # ground-truth examples of multi-session step_index reuse.
-            step_index = int(entry.get("step_index") or entry.get("stepIndex") or line_number)
+            raw_step = entry.get("step_index")
+            raw_step_alt = entry.get("stepIndex")
+            step_index = int(raw_step if raw_step is not None else (
+                raw_step_alt if raw_step_alt is not None else line_number
+            ))
             if step_index <= last_step:
                 continue
             text = entry.get("text") or entry.get("content") or entry.get("message") or ""

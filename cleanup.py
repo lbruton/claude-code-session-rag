@@ -157,7 +157,7 @@ def cmd_status(args):
     print(f"\nDB location:  {db}")
 
 
-def cmd_backfill(args):
+def cmd_backfill(args) -> int:
     """Control the provider-aware backfill queue."""
     from backfill_manager import BackfillManager
 
@@ -271,7 +271,9 @@ def main():
         "status": cmd_status,
         "backfill": cmd_backfill,
     }
-    commands[args.command](args)
+    return_code = commands[args.command](args)
+    if return_code is not None:
+        sys.exit(return_code)
 
 
 if __name__ == "__main__":

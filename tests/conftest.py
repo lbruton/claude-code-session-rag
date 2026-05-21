@@ -128,9 +128,29 @@ def synthetic_codex_home(tmp_path):
     active_rollout = active / "rollout-synthetic-session.jsonl"
     archived_rollout = archive / "rollout-synthetic-session.jsonl"
     lines = [
-        {"session_id": "synthetic-session", "type": "turn_context", "cwd": str(tmp_path)},
-        {"type": "response_item", "role": "user", "content": "synthetic codex question"},
-        {"type": "response_item", "role": "assistant", "content": "synthetic codex answer"},
+        {
+            "timestamp": "2026-05-21T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "synthetic-session", "cwd": str(tmp_path)},
+        },
+        {
+            "timestamp": "2026-05-21T10:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "synthetic codex question"}],
+            },
+        },
+        {
+            "timestamp": "2026-05-21T10:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "synthetic codex answer"}],
+            },
+        },
     ]
     payload = "\n".join(json.dumps(line) for line in lines) + "\n"
     active_rollout.write_text(payload)

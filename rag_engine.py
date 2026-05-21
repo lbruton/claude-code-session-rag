@@ -24,8 +24,6 @@ os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
 
 from pymilvus import MilvusClient, DataType, CollectionSchema, FieldSchema
-from mlx_embeddings.utils import load as mlx_load, generate as mlx_generate
-import mlx.core as mx
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator, List, Dict, Optional
@@ -139,7 +137,18 @@ def get_model_name() -> str:
 
 def get_embedding_identity() -> Dict[str, object]:
     """Return the active local embedding identity for health/status output."""
-    identity = EmbeddingIdentity.current_local()
+    try:
+        identity = EmbeddingIdentity.current_local()
+    except ValueError as exc:
+        logger.warning("Invalid embedding identity: %s", exc)
+        return {
+            "embedding_provider": "unknown",
+            "model_name": "unknown",
+            "dimension": None,
+            "collection_name": COLLECTION_NAME,
+            "created_at": "",
+            "error": str(exc),
+        }
     return {
         "embedding_provider": identity.embedding_provider,
         "model_name": identity.model_name,
@@ -150,6 +159,21 @@ def get_embedding_identity() -> Dict[str, object]:
 
 _mlx_model = None
 _mlx_tokenizer = None
+_mlx_load = None
+_mlx_generate = None
+_mlx_core = None
+
+
+def _load_mlx_runtime():
+    """Import MLX lazily so non-embedding tests/status paths cannot crash at import time."""
+    global _mlx_load, _mlx_generate, _mlx_core
+    if _mlx_load is None or _mlx_generate is None or _mlx_core is None:
+        from mlx_embeddings.utils import load as mlx_load, generate as mlx_generate
+        import mlx.core as mx
+        _mlx_load = mlx_load
+        _mlx_generate = mlx_generate
+        _mlx_core = mx
+    return _mlx_load, _mlx_generate, _mlx_core
 
 
 def get_model():
@@ -165,6 +189,7 @@ def get_model():
         )
 
     print(f"Loading {_MODEL_ID} via mlx-embeddings...", file=sys.stderr)
+    mlx_load, _, _ = _load_mlx_runtime()
     _mlx_model, _mlx_tokenizer = mlx_load(_MODEL_ID)
     print(f"{_MODEL_ID} ready ({_EMBED_DIM} dims, {_MODEL_CFG['max_tokens']} token context)", file=sys.stderr)
     return _mlx_model, _mlx_tokenizer
@@ -182,6 +207,7 @@ def _needs_input_remap() -> bool:
 def embed_texts(texts: List[str], is_query: bool = False) -> List[List[float]]:
     """Embed texts using the configured model. Adds model-specific prefix."""
     model, tokenizer = get_model()
+    _, mlx_generate, mx = _load_mlx_runtime()
     prefix = _SEARCH_PREFIX if is_query else _DOCUMENT_PREFIX
     prefixed = [prefix + t for t in texts]
 

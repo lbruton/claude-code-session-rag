@@ -46,7 +46,7 @@ class OpenCodeAdapter:
 
         message_root = self.storage_root / "message"
         if message_root.exists():
-            for path in sorted(message_root.glob("*.json")):
+            for path in sorted(message_root.rglob("*.json")):
                 data = self._load_json(path)
                 session_id = data.get("sessionID") or data.get("session_id")
                 if session_id:
@@ -57,7 +57,7 @@ class OpenCodeAdapter:
 
         part_root = self.storage_root / "part"
         if part_root.exists():
-            for path in sorted(part_root.glob("*.json")):
+            for path in sorted(part_root.rglob("*.json")):
                 data = self._load_json(path)
                 self._all_parts.append((path, data))
                 session_id = data.get("sessionID") or data.get("session_id")
@@ -80,7 +80,7 @@ class OpenCodeAdapter:
 
     def _session_files(self) -> List[Path]:
         root = self.storage_root / "session"
-        return sorted(root.glob("*.json")) if root.exists() else []
+        return sorted(root.rglob("*.json")) if root.exists() else []
 
     def discover_sources(self) -> List[ProviderSource]:
         # Build per-pass indexes once; reused by every parse_source() call
@@ -101,7 +101,7 @@ class OpenCodeAdapter:
                 logical_session_id=logical_session_id,
                 path=str(path),
                 canonical_path=canonical_path,
-                project_root=data.get("cwd", "unknown"),
+                project_root=data.get("cwd") or data.get("directory") or "unknown",
                 timestamp=created,
                 status="eligible",
             ))

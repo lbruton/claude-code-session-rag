@@ -29,7 +29,7 @@ def test_local_backfill_control_endpoint_exists(stub_rag_engine):
     assert "/backfill" in routes or "/backfill/control" in routes
 
 
-def _backfill_client(stub_rag_engine):
+def _backfill_client(stub_rag_engine, tmp_path, monkeypatch):
     """Reload http_server with the rag_engine stub in place and wrap it in a
     Starlette TestClient. Each test gets a fresh import so /backfill state
     can't leak across tests."""
@@ -38,21 +38,22 @@ def _backfill_client(stub_rag_engine):
 
     from starlette.testclient import TestClient
 
+    monkeypatch.setenv("HOME", str(tmp_path))
     # Force a fresh module so the in-process _backfill_manager is reset.
     sys.modules.pop("http_server", None)
     http_server = importlib.import_module("http_server")
     return http_server, TestClient(http_server.app)
 
 
-def test_backfill_pause_endpoint_pauses_provider(stub_rag_engine):
-    http_server, client = _backfill_client(stub_rag_engine)
+def test_backfill_pause_endpoint_pauses_provider(stub_rag_engine, tmp_path, monkeypatch):
+    http_server, client = _backfill_client(stub_rag_engine, tmp_path, monkeypatch)
     resp = client.post("/backfill", json={"action": "pause", "provider": "codex"})
     assert resp.status_code == 200
     assert "codex" in http_server._backfill_manager.paused_providers
 
 
-def test_backfill_enqueue_endpoint_queues_recent_mode(stub_rag_engine):
-    http_server, client = _backfill_client(stub_rag_engine)
+def test_backfill_enqueue_endpoint_queues_recent_mode(stub_rag_engine, tmp_path, monkeypatch):
+    http_server, client = _backfill_client(stub_rag_engine, tmp_path, monkeypatch)
     resp = client.post(
         "/backfill",
         json={"action": "enqueue", "provider": "opencode", "mode": "recent"},
@@ -62,14 +63,14 @@ def test_backfill_enqueue_endpoint_queues_recent_mode(stub_rag_engine):
     assert any(j.provider == "opencode" and j.mode == "recent" for j in queued)
 
 
-def test_backfill_unknown_action_returns_400(stub_rag_engine):
-    _, client = _backfill_client(stub_rag_engine)
+def test_backfill_unknown_action_returns_400(stub_rag_engine, tmp_path, monkeypatch):
+    _, client = _backfill_client(stub_rag_engine, tmp_path, monkeypatch)
     resp = client.post("/backfill", json={"action": "garbage"})
     assert resp.status_code == 400
 
 
-def test_backfill_enqueue_rejects_non_integer_priority(stub_rag_engine):
-    _, client = _backfill_client(stub_rag_engine)
+def test_backfill_enqueue_rejects_non_integer_priority(stub_rag_engine, tmp_path, monkeypatch):
+    _, client = _backfill_client(stub_rag_engine, tmp_path, monkeypatch)
     resp = client.post(
         "/backfill",
         json={

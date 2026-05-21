@@ -187,6 +187,27 @@ class BackfillManager:
                 paused=self.global_paused,
             )
 
+    def complete_job(
+        self,
+        job_id: str,
+        processed_sources: int = 0,
+        indexed_turns: int = 0,
+        errors: int = 0,
+    ) -> None:
+        """Remove a finished job and merge its counters into provider status."""
+        with self._lock:
+            job = self.jobs.pop(job_id, None)
+            if job is None:
+                return
+            provider_status = self._ensure_provider(job.provider)
+            provider_status.processed_sources += processed_sources
+            provider_status.indexed_turns += indexed_turns
+            provider_status.error_count += errors
+            provider_status.queued_jobs = sum(
+                1 for queued in self.jobs.values() if queued.provider == job.provider
+            )
+            self.save_state()
+
     def load_state(self) -> None:
         with self._lock:
             if not self.state_path.exists():
