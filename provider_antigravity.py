@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional
 import hashlib
@@ -25,10 +26,12 @@ class AntigravityAdapter:
             self.provider = "antigravity_desktop"
             self.source_kind = "antigravity_desktop_transcript_jsonl"
             self.root = self.home / ".gemini" / "antigravity"
-        else:
+        elif source_kind == "cli":
             self.provider = "antigravity_cli"
             self.source_kind = "antigravity_cli_transcript_jsonl"
             self.root = self.home / ".gemini" / "antigravity-cli"
+        else:
+            raise ValueError(f"unknown source_kind: {source_kind!r}")
 
     def _load_history(self) -> Dict[str, str]:
         history_path = self.root / "history.jsonl"
@@ -100,9 +103,17 @@ class AntigravityAdapter:
             # ground-truth examples of multi-session step_index reuse.
             raw_step = entry.get("step_index")
             raw_step_alt = entry.get("stepIndex")
-            step_index = int(raw_step if raw_step is not None else (
-                raw_step_alt if raw_step_alt is not None else line_number
-            ))
+            try:
+                step_index = int(raw_step if raw_step is not None else (
+                    raw_step_alt if raw_step_alt is not None else line_number
+                ))
+            except (TypeError, ValueError):
+                warnings.warn(
+                    f"provider_antigravity: malformed step_index {raw_step!r}/{raw_step_alt!r}"
+                    f" at line {line_number} of {source.path!r}; skipping record",
+                    stacklevel=1,
+                )
+                continue
             if step_index <= last_step:
                 continue
             text = entry.get("text") or entry.get("content") or entry.get("message") or ""

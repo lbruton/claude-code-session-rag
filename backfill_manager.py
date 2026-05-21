@@ -11,6 +11,8 @@ import os
 import threading
 import time
 
+from provider_adapters import LEGAL_PROVIDERS
+
 
 @dataclass
 class BackfillJob:
@@ -88,6 +90,9 @@ class BackfillManager:
         since: str = "",
         priority: int = 0,
     ) -> BackfillJob:
+        if provider not in LEGAL_PROVIDERS:
+            allowed = ", ".join(sorted(LEGAL_PROVIDERS))
+            raise ValueError(f"Unknown provider: {provider!r}; expected one of: {allowed}")
         if mode not in {"recent", "incremental", "full"}:
             raise ValueError(f"Unsupported backfill mode: {mode}")
         with self._lock:
@@ -213,7 +218,7 @@ class BackfillManager:
             if not self.state_path.exists():
                 return
             try:
-                data = json.loads(self.state_path.read_text())
+                data = json.loads(self.state_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 return
             self.global_paused = bool(data.get("global_paused", False))
@@ -249,6 +254,6 @@ class BackfillManager:
             }
             # Atomic write — never expose a partially-written state file to
             # a concurrent loader after a crash.
-            tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-            tmp_path.write_text(json.dumps(data, indent=2, sort_keys=True))
+            tmp_path = self.state_path.with_name(f"{self.state_path.name}.{os.getpid()}.tmp")
+            tmp_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
             os.replace(tmp_path, self.state_path)

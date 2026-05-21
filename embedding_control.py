@@ -96,7 +96,7 @@ class EmbeddingBudget:
     def before_batch(self, batch_size: int, estimated_chars: int = 0) -> EmbeddingDecision:
         if self.paused:
             return EmbeddingDecision(False, "Backfill embedding is paused")
-        if self.turns_processed >= self.max_turns_per_run:
+        if self.turns_processed + batch_size > self.max_turns_per_run:
             return EmbeddingDecision(False, "Backfill max turns per run reached")
         if batch_size > self.batch_size:
             return EmbeddingDecision(

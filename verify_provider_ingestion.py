@@ -18,7 +18,13 @@ def _newest_source(adapter):
     sources = [source for source in adapter.discover_sources() if source.status == "eligible"]
     if not sources:
         return None
-    return max(sources, key=lambda source: Path(source.path).stat().st_mtime if Path(source.path).exists() else 0)
+    def _mtime(source):
+        try:
+            return Path(source.path).stat().st_mtime
+        except (FileNotFoundError, OSError):
+            return 0
+
+    return max(sources, key=_mtime)
 
 
 async def main() -> int:
@@ -41,12 +47,21 @@ async def main() -> int:
         if source is None:
             print(f"{adapter.provider}: no eligible local source found")
             continue
-        result = adapter.parse_source(source, cursor=None)
+        try:
+            result = adapter.parse_source(source, cursor=None)
+        except Exception as exc:
+            print(f"{adapter.provider}: parse_source failed — {exc}")
+            exit_code = 1
+            continue
         if result.errors:
             exit_code = 1
         indexed = 0
         if args.index and result.turns:
-            indexed = await rag_engine.add_turns_async(result.turns, db_path=args.db_path)
+            try:
+                indexed = await rag_engine.add_turns_async(result.turns, db_path=args.db_path)
+            except Exception as exc:
+                print(f"{adapter.provider}: add_turns_async failed — {exc}")
+                exit_code = 1
         print(
             f"{adapter.provider}: source={Path(source.path).name} "
             f"turns={len(result.turns)} indexed={indexed} errors={len(result.errors)}"

@@ -140,12 +140,12 @@ class OpenCodeAdapter:
         for _, part in parts:
             message_id = part.get("messageID") or part.get("message_id")
             if message_id:
-                parts_by_message.setdefault(message_id, []).append(part)
+                parts_by_message.setdefault(str(message_id), []).append(part)
 
         emitted = set((cursor or {}).get("emitted_ids", []))
         turns = []
         for index, (_, message) in enumerate(messages):
-            message_id = message.get("id", "")
+            message_id = str(message.get("id", ""))
             role = message.get("role", "")
             content_parts = [
                 part.get("text", "")

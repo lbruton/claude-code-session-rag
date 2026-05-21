@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Dict, Iterable, Optional
+
+logger = logging.getLogger(__name__)
 
 import rag_engine
 import transcript_parser
@@ -70,23 +73,35 @@ class ProviderIngestionService:
         errors = 0
         sources = self._select_sources(adapter.discover_sources(), job)
 
-        for source in sources:
-            cursor = transcript_parser.get_provider_cursor(state, source.provider, source.source_id)
-            result = adapter.parse_source(source, cursor=cursor)
-            processed_sources += 1
-            if result.errors:
-                errors += len(result.errors)
-            if result.turns:
-                indexed_turns += await rag_engine.add_turns_async(result.turns, db_path=self.db_path)
-            transcript_parser.set_provider_cursor(state, source.provider, source.source_id, result.cursor)
+        try:
+            for source in sources:
+                cursor = transcript_parser.get_provider_cursor(state, source.provider, source.source_id)
+                try:
+                    result = adapter.parse_source(source, cursor=cursor)
+                    processed_sources += 1
+                    if result.errors:
+                        errors += len(result.errors)
+                    if result.turns:
+                        indexed_turns += await rag_engine.add_turns_async(result.turns, db_path=self.db_path)
+                    transcript_parser.set_provider_cursor(state, source.provider, source.source_id, result.cursor)
+                except Exception as exc:
+                    errors += 1
+                    logger.error(
+                        "Error processing source %s/%s: %s",
+                        source.provider,
+                        source.source_id,
+                        exc,
+                        exc_info=True,
+                    )
 
-        transcript_parser.save_index_state(state)
-        self.manager.complete_job(
-            job.job_id,
-            processed_sources=processed_sources,
-            indexed_turns=indexed_turns,
-            errors=errors,
-        )
+            transcript_parser.save_index_state(state)
+        finally:
+            self.manager.complete_job(
+                job.job_id,
+                processed_sources=processed_sources,
+                indexed_turns=indexed_turns,
+                errors=errors,
+            )
         return {
             "jobs": 1,
             "processed_sources": processed_sources,

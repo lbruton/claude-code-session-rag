@@ -233,7 +233,7 @@ _persistent_clients: Dict[str, MilvusClient] = {}
 _fts = FTSIndex("turns_fts", [
     "session_id", "git_branch", "turn_index", "timestamp", "chunk_type",
     "project_root", "logical_session_id", "provider", "source_kind",
-    "source_class", "source_id",
+    "source_class", "source_id", "source_path",
 ])
 _write_lock: Optional[asyncio.Lock] = None
 _embed_semaphore: Optional[asyncio.Semaphore] = None
@@ -465,9 +465,9 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
     if not new_turns:
         return 0
 
+    provider_defaults = default_provider_metadata()
     data = []
     for turn, emb in zip(new_turns, embeddings):
-        provider_defaults = default_provider_metadata()
         # Stable hash: SHA-256 truncated to int64. Python's hash() is
         # randomized per process, so the same doc_id would get different
         # primary keys across server restarts.
@@ -504,10 +504,11 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
                 "content": t["text"],
                 "session_id": t.get("session_id", ""),
                 "logical_session_id": t.get("logical_session_id", t.get("session_id", "")),
-                "provider": t.get("provider", default_provider_metadata()["provider"]),
-                "source_kind": t.get("source_kind", default_provider_metadata()["source_kind"]),
-                "source_class": t.get("source_class", default_provider_metadata()["source_class"]),
+                "provider": t.get("provider", provider_defaults["provider"]),
+                "source_kind": t.get("source_kind", provider_defaults["source_kind"]),
+                "source_class": t.get("source_class", provider_defaults["source_class"]),
                 "source_id": t.get("source_id", ""),
+                "source_path": t.get("source_path", t.get("transcript_file", "")),
                 "git_branch": t.get("git_branch", ""),
                 "turn_index": t.get("turn_index", 0),
                 "timestamp": t.get("timestamp", ""),
@@ -520,6 +521,21 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
         logger.warning("FTS insert failed (non-fatal): %s", e)
 
     return len(data)
+
+
+def _escape_filter_scalar(value: str) -> str:
+    """Escape a string value for use in a Milvus boolean-expression filter literal.
+
+    Milvus filter literals use double-quoted strings (e.g. field == "value").
+    Rules:
+      - NUL bytes are never valid in identifiers or scalar values; reject them
+        outright so a malformed input cannot truncate the filter expression.
+      - Any embedded double-quote character must be doubled ("" is the escape
+        sequence inside a Milvus double-quoted string literal).
+    """
+    if "\x00" in value:
+        raise ValueError("Filter scalar value must not contain NUL bytes")
+    return value.replace('"', '""')
 
 
 def search(query: str, n: int = 5, session_id: Optional[str] = None,
@@ -560,11 +576,11 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
 
     filters = []
     if session_id:
-        filters.append(f'session_id == "{session_id}"')
+        filters.append(f'session_id == "{_escape_filter_scalar(session_id)}"')
     if git_branch:
-        filters.append(f'git_branch == "{git_branch}"')
+        filters.append(f'git_branch == "{_escape_filter_scalar(git_branch)}"')
     if project_root:
-        filters.append(f'project_root == "{project_root}"')
+        filters.append(f'project_root == "{_escape_filter_scalar(project_root)}"')
     if provider:
         filters.append(f'provider == "{provider}"')
     if source_kind:
@@ -592,11 +608,11 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
                            "source_kind", "source_class", "source_id", "source_path"],
         )
 
+    provider_defaults = default_provider_metadata()
     vector_results = []
     if results and results[0]:
         for hit in results[0]:
             entity = hit["entity"]
-            provider_defaults = default_provider_metadata()
             vector_results.append({
                 "content": entity["document"],
                 "doc_id": entity.get("doc_id", ""),
@@ -647,12 +663,12 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
         return []
 
     # Clean up internal RRF score before recency boost
+    merge_defaults = default_provider_metadata()
     for r in merged:
         r.pop("_rrf_score", None)
-        defaults = default_provider_metadata()
-        r.setdefault("provider", defaults["provider"])
-        r.setdefault("source_kind", defaults["source_kind"])
-        r.setdefault("source_class", defaults["source_class"])
+        r.setdefault("provider", merge_defaults["provider"])
+        r.setdefault("source_kind", merge_defaults["source_kind"])
+        r.setdefault("source_class", merge_defaults["source_class"])
         r.setdefault("logical_session_id", r.get("session_id", ""))
 
     if recency_boost and merged:
@@ -747,7 +763,7 @@ def get_turns(session_id: str, turn_index: int, context: int = 2,
     with milvus_client(db_path) as client:
         results = client.query(
             collection_name=COLLECTION_NAME,
-            filter=f'session_id == "{session_id}"',
+            filter=f'session_id == "{_escape_filter_scalar(session_id)}"',
             output_fields=["document", "doc_id", "session_id", "transcript_file",
                            "turn_index", "timestamp", "git_branch", "chunk_type",
                            "logical_session_id", "provider", "source_kind",
@@ -774,6 +790,7 @@ def get_turns(session_id: str, turn_index: int, context: int = 2,
     start = max(0, target_idx - context)
     end = min(len(results), target_idx + context + 1)
 
+    turn_defaults = default_provider_metadata()
     formatted = []
     for row in results[start:end]:
         formatted.append({
@@ -781,9 +798,9 @@ def get_turns(session_id: str, turn_index: int, context: int = 2,
             "doc_id": row.get("doc_id", ""),
             "session_id": row.get("session_id", ""),
             "logical_session_id": row.get("logical_session_id", row.get("session_id", "")),
-            "provider": row.get("provider", default_provider_metadata()["provider"]),
-            "source_kind": row.get("source_kind", default_provider_metadata()["source_kind"]),
-            "source_class": row.get("source_class", default_provider_metadata()["source_class"]),
+            "provider": row.get("provider", turn_defaults["provider"]),
+            "source_kind": row.get("source_kind", turn_defaults["source_kind"]),
+            "source_class": row.get("source_class", turn_defaults["source_class"]),
             "source_id": row.get("source_id", ""),
             "source_path": row.get("source_path", row.get("transcript_file", "")),
             "transcript_file": row.get("transcript_file", ""),
@@ -805,7 +822,7 @@ def get_stats(project_root: Optional[str] = None, db_path: Optional[str] = None)
     # Query for breakdowns (capped by Milvus offset limit)
     all_results = _query_all(
         ["session_id", "chunk_type", "git_branch", "project_root", "provider"],
-        filter_expr=f'project_root == "{project_root}"' if project_root else None,
+        filter_expr=f'project_root == "{_escape_filter_scalar(project_root)}"' if project_root else None,
         db_path=db_path,
     )
 
@@ -878,16 +895,17 @@ def _query_all(output_fields: list, batch_size: int = 1000,
 
 def delete_by_session(session_id: str, db_path: Optional[str] = None) -> int:
     """Delete all turns for a given session ID."""
+    escaped_sid = _escape_filter_scalar(session_id)
     with milvus_client(db_path) as client:
         results = client.query(
             collection_name=COLLECTION_NAME,
-            filter=f'session_id == "{session_id}"',
+            filter=f'session_id == "{escaped_sid}"',
             output_fields=["id"],
         )
         if results:
             client.delete(
                 collection_name=COLLECTION_NAME,
-                filter=f'session_id == "{session_id}"',
+                filter=f'session_id == "{escaped_sid}"',
             )
 
     # Also delete from FTS
@@ -904,16 +922,17 @@ def delete_by_session(session_id: str, db_path: Optional[str] = None) -> int:
 
 def delete_by_branch(git_branch: str, db_path: Optional[str] = None) -> int:
     """Delete all turns for a given git branch."""
+    escaped_branch = _escape_filter_scalar(git_branch)
     with milvus_client(db_path) as client:
         results = client.query(
             collection_name=COLLECTION_NAME,
-            filter=f'git_branch == "{git_branch}"',
+            filter=f'git_branch == "{escaped_branch}"',
             output_fields=["id"],
         )
         if results:
             client.delete(
                 collection_name=COLLECTION_NAME,
-                filter=f'git_branch == "{git_branch}"',
+                filter=f'git_branch == "{escaped_branch}"',
             )
 
     # Also delete from FTS
@@ -991,7 +1010,8 @@ def backfill_fts(db_path: Optional[str] = None) -> int:
         output_fields = ["doc_id", "document", "session_id", "git_branch",
                          "turn_index", "timestamp", "chunk_type", "project_root",
                          "logical_session_id", "provider", "source_kind",
-                         "source_class", "source_id"]
+                         "source_class", "source_id", "source_path"]
+        backfill_defaults = default_provider_metadata()
         BATCH_FETCH = 100
         inserted = 0
 
@@ -1013,10 +1033,11 @@ def backfill_fts(db_path: Optional[str] = None) -> int:
                             "content": r.get("document", ""),
                             "session_id": r.get("session_id", ""),
                             "logical_session_id": r.get("logical_session_id", r.get("session_id", "")),
-                            "provider": r.get("provider", default_provider_metadata()["provider"]),
-                            "source_kind": r.get("source_kind", default_provider_metadata()["source_kind"]),
-                            "source_class": r.get("source_class", default_provider_metadata()["source_class"]),
+                            "provider": r.get("provider", backfill_defaults["provider"]),
+                            "source_kind": r.get("source_kind", backfill_defaults["source_kind"]),
+                            "source_class": r.get("source_class", backfill_defaults["source_class"]),
                             "source_id": r.get("source_id", ""),
+                            "source_path": r.get("source_path", r.get("transcript_file", "")),
                             "git_branch": r.get("git_branch", ""),
                             "turn_index": r.get("turn_index", 0),
                             "timestamp": r.get("timestamp", ""),
@@ -1074,7 +1095,7 @@ def list_sessions(project_root: Optional[str] = None,
     """List all sessions with turn counts and date ranges. Optionally filter by project."""
     all_results = _query_all(
         ["session_id", "timestamp", "git_branch", "chunk_type", "project_root"],
-        filter_expr=f'project_root == "{project_root}"' if project_root else None,
+        filter_expr=f'project_root == "{_escape_filter_scalar(project_root)}"' if project_root else None,
         db_path=db_path,
     )
 
@@ -1128,19 +1149,15 @@ async def search_async(query: str, n: int = 5, session_id: Optional[str] = None,
     executor = _embed_executor
     semaphore = _embed_semaphore
 
-    if semaphore is not None:
-        async with semaphore:
-            return await loop.run_in_executor(
-                executor,
-                lambda: search(
-                    query, n, session_id=session_id, git_branch=git_branch,
-                    project_root=project_root, recency_boost=recency_boost,
-                    provider=provider, source_kind=source_kind, db_path=db_path,
-                ),
-            )
-    else:
+    if semaphore is None or executor is None:
+        raise RuntimeError(
+            "MLX embed executor not initialized — call init_server_mode() before "
+            "using search_async(). Running embeddings on the default executor can "
+            "hop OS threads and trigger Metal SIGSEGV (see SESF-8)."
+        )
+    async with semaphore:
         return await loop.run_in_executor(
-            None,
+            executor,
             lambda: search(
                 query, n, session_id=session_id, git_branch=git_branch,
                 project_root=project_root, recency_boost=recency_boost,
@@ -1159,9 +1176,12 @@ async def add_turns_async(turns: List[Dict], db_path: Optional[str] = None) -> i
     semaphore = _embed_semaphore
     write_lock = _write_lock
 
-    if semaphore is not None and write_lock is not None:
-        async with semaphore:
-            async with write_lock:
-                return await loop.run_in_executor(executor, lambda: add_turns(turns, db_path))
-    else:
-        return await loop.run_in_executor(None, lambda: add_turns(turns, db_path))
+    if semaphore is None or write_lock is None or executor is None:
+        raise RuntimeError(
+            "MLX embed executor not initialized — call init_server_mode() before "
+            "using add_turns_async(). Running embeddings on the default executor can "
+            "hop OS threads and trigger Metal SIGSEGV (see SESF-8)."
+        )
+    async with semaphore:
+        async with write_lock:
+            return await loop.run_in_executor(executor, lambda: add_turns(turns, db_path))

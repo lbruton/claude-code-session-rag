@@ -189,8 +189,17 @@ _server_mode_ready = False
 _BACKFILL_STATE = _SERVER_DIR / "backfill_state.json"
 _backfill_manager = BackfillManager(_BACKFILL_STATE)
 
+# TTL cache for provider health — avoid expensive I/O on every /health probe.
+_PROVIDER_HEALTH_TTL = 30  # seconds
+_provider_health_cache: dict | None = None
+_provider_health_cache_ts: float = 0.0
 
-def _provider_health() -> dict:
+
+def _provider_health(deep: bool = False) -> dict:
+    global _provider_health_cache, _provider_health_cache_ts
+    now = time.monotonic()
+    if not deep and _provider_health_cache is not None and (now - _provider_health_cache_ts) < _PROVIDER_HEALTH_TTL:
+        return _provider_health_cache
     providers = [
         ClaudeCodeCliAdapter(),
         ClaudeDesktopCoworkProbe(),
@@ -207,6 +216,8 @@ def _provider_health() -> dict:
         except Exception as exc:
             name = getattr(provider, "provider", provider.__class__.__name__)
             health[name] = {"provider": name, "status": "error", "error": str(exc)}
+    _provider_health_cache = health
+    _provider_health_cache_ts = now
     return health
 
 
@@ -223,14 +234,19 @@ def _backfill_status_payload() -> dict:
 
 
 def _embedding_status_payload() -> dict:
-    identity = EmbeddingIdentity.current_local()
+    try:
+        identity = EmbeddingIdentity.current_local()
+        identity_data = asdict(identity)
+    except Exception as exc:
+        identity_data = {"status": "error", "message": str(exc)}
     return {
-        "identity": asdict(identity),
+        "identity": identity_data,
         "budget": get_embedding_budget().status(),
     }
 
 
 async def health(request: Request) -> JSONResponse:
+    deep = request is not None and request.query_params.get("deep") == "1"
     watchers = file_watcher.get_watcher_status()
     return JSONResponse({
         "status": "ok",
@@ -241,7 +257,7 @@ async def health(request: Request) -> JSONResponse:
         "milvus": _server_mode_ready,
         "milvus_backend": "standalone" if MILVUS_URI.startswith("http") else "lite",
         "watchers": {k: v for k, v in watchers.items()},
-        "providers": _provider_health(),
+        "providers": _provider_health(deep=deep),
         "backfill": _backfill_status_payload(),
         "embedding": _embedding_status_payload(),
     })
@@ -266,14 +282,31 @@ async def backfill_control_endpoint(request: Request) -> JSONResponse:
     elif action == "enqueue":
         if not provider:
             return JSONResponse({"error": "provider is required for enqueue"}, status_code=400)
+        mode = body.get("mode", "recent")
+        _VALID_MODES = {"recent", "incremental", "full"}
+        if mode not in _VALID_MODES:
+            return JSONResponse(
+                {"detail": f"Invalid mode {mode!r}. Must be one of: {sorted(_VALID_MODES)}"},
+                status_code=400,
+            )
+        raw_limit = body.get("limit")
+        limit: int | None = None
+        if raw_limit is not None:
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"detail": "limit must be an integer"},
+                    status_code=400,
+                )
         try:
             priority = int(body.get("priority", 0))
         except (TypeError, ValueError):
             return JSONResponse({"error": "priority must be an integer"}, status_code=400)
         _backfill_manager.enqueue_provider_backfill(
             provider=provider,
-            mode=body.get("mode", "recent"),
-            limit=body.get("limit"),
+            mode=mode,
+            limit=limit,
             since=body.get("since", ""),
             priority=priority,
         )
