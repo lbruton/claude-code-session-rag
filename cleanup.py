@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import rag_engine
+from embedding_control import EmbeddingIdentity, get_embedding_budget
 
 
 def get_db_path() -> str:
@@ -120,7 +121,96 @@ def cmd_stats(args):
     print(f"\nDB location:  {db}")
 
 
-def main():
+def cmd_status(args):
+    """Show provider-aware index, embedding, and backfill status."""
+    db = get_db_path()
+    project = getattr(args, "project", None)
+    provider_filter = getattr(args, "provider", None)
+    stats = rag_engine.get_stats(project_root=project, db_path=db)
+    identity = EmbeddingIdentity.current_local()
+    budget = get_embedding_budget().status()
+
+    print("Provider Status")
+    providers = stats.get("providers", {})
+    if provider_filter:
+        providers = {
+            provider: count
+            for provider, count in providers.items()
+            if provider == provider_filter
+        }
+    if providers:
+        for provider, count in sorted(providers.items()):
+            print(f"  Provider {provider}: {count} turns")
+    else:
+        print("  Provider counts unavailable or empty")
+
+    print("\nEmbedding")
+    print(f"  Provider: {identity.embedding_provider}")
+    print(f"  Model:    {identity.model_name}")
+    print(f"  Dim:      {identity.dimension}")
+    print(f"  Paused:   {budget.get('paused')}")
+
+    print("\nBackfill")
+    print(f"  Mode:       {budget.get('mode')}")
+    print(f"  Batch size: {budget.get('batch_size')}")
+    print(f"  Cooldown:   {budget.get('cooldown_ms')} ms")
+    print(f"\nDB location:  {db}")
+
+
+def cmd_backfill(args) -> int:
+    """Control the provider-aware backfill queue."""
+    from backfill_manager import BackfillManager
+
+    state_path = Path.home() / ".sessionflow" / "backfill_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    manager = BackfillManager(state_path)
+
+    provider_arg = getattr(args, "provider", None)
+    provider_label = provider_arg or "all"
+    provider_kw = None if not provider_arg else provider_arg
+    action = args.action
+
+    try:
+        if action == "status":
+            status = manager.status()
+            print(f"Backfill status (provider={provider_label}):")
+            print(f"  Global paused: {status.paused}")
+            print(f"  Queued jobs:   {len(status.jobs)}")
+            for job in status.jobs:
+                if provider_kw and job.provider != provider_kw:
+                    continue
+                print(f"    [{job.provider}] {job.mode} job={job.job_id} priority={job.priority}")
+            for provider, pstatus in sorted(status.providers.items()):
+                if provider_kw and provider != provider_kw:
+                    continue
+                print(
+                    f"  Provider {provider}: queued={pstatus.queued_jobs} "
+                    f"paused={pstatus.paused} processed_sources={pstatus.processed_sources} "
+                    f"indexed_turns={pstatus.indexed_turns} errors={pstatus.error_count}"
+                )
+        elif action == "pause":
+            manager.pause(provider=provider_kw)
+            print(f"Backfill paused: provider={provider_label}")
+        elif action == "resume":
+            manager.resume(provider=provider_kw)
+            print(f"Backfill resumed: provider={provider_label}")
+        elif action == "enqueue":
+            if not provider_kw:
+                print("Backfill enqueue requires --provider <name>", file=sys.stderr)
+                return 2
+            mode = getattr(args, "mode", None) or "recent"
+            job = manager.enqueue_provider_backfill(provider=provider_kw, mode=mode)
+            print(f"Backfill enqueued: provider={provider_kw} mode={mode} job_id={job.job_id}")
+        else:
+            print(f"Unknown backfill action: {action}", file=sys.stderr)
+            return 2
+    except Exception as exc:
+        print(f"Backfill {action} failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Manage SessionFlow index data",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -149,6 +239,27 @@ def main():
     p_stats = subparsers.add_parser("stats", help="Show index statistics")
     p_stats.add_argument("--project", help="Filter to a specific project root")
 
+    # status
+    p_status = subparsers.add_parser("status", help="Show provider/backfill/embedding status")
+    p_status.add_argument("--project", help="Filter to a specific project root")
+    p_status.add_argument("--provider", help="Filter status to a provider")
+
+    # backfill controls
+    p_backfill = subparsers.add_parser("backfill", help="Control provider backfill")
+    backfill_sub = p_backfill.add_subparsers(dest="action", required=True)
+    for action in ("status", "pause", "resume"):
+        p_action = backfill_sub.add_parser(action, help=f"{action} provider backfill")
+        p_action.add_argument("--provider", help="Provider to control")
+    p_enqueue = backfill_sub.add_parser("enqueue", help="Enqueue provider backfill")
+    p_enqueue.add_argument("--provider", required=True, help="Provider to enqueue")
+    p_enqueue.add_argument("--mode", default="recent", choices=("recent", "incremental", "full"))
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+
     args = parser.parse_args()
 
     commands = {
@@ -157,8 +268,12 @@ def main():
         "delete": cmd_delete,
         "reset": cmd_reset,
         "stats": cmd_stats,
+        "status": cmd_status,
+        "backfill": cmd_backfill,
     }
-    commands[args.command](args)
+    return_code = commands[args.command](args)
+    if return_code is not None:
+        sys.exit(return_code)
 
 
 if __name__ == "__main__":

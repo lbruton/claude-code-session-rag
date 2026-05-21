@@ -259,6 +259,31 @@ with open(claude_json, "w") as f:
 print("  MCP server added to ~/.claude.json (user scope, all projects)")
 PYEOF
 
+# --- Optional LaunchAgent (autostart at login) ---
+# Off by default. Enable non-interactively with SESSIONFLOW_INSTALL_AGENT=1, or
+# answer "y" when prompted in an interactive shell. The LaunchAgent runs
+# ./sessionflow-server.sh start at login, before any harness hooks fire — this
+# avoids multiple terminals racing on server start when several harnesses
+# (Claude Code, Codex, OpenCode, Antigravity CLI) launch at once.
+echo ""
+INSTALL_AGENT="${SESSIONFLOW_INSTALL_AGENT:-}"
+if [ -z "$INSTALL_AGENT" ] && [ -t 0 ]; then
+    read -r -p "Install optional macOS LaunchAgent to autostart SessionFlow at login? [y/N] " INSTALL_AGENT || true
+fi
+case "${INSTALL_AGENT:-n}" in
+    1|y|Y|yes|YES)
+        echo "Installing LaunchAgent..."
+        "$SCRIPT_DIR/sessionflow-server.sh" install-agent || \
+            echo "  LaunchAgent install reported a soft failure — run './sessionflow-server.sh agent-status' to verify."
+        ;;
+    *)
+        echo "Skipping LaunchAgent install (optional)."
+        echo "  Install later with: ./sessionflow-server.sh install-agent"
+        echo "  Uninstall with:     ./sessionflow-server.sh uninstall-agent"
+        echo "  Inspect with:       ./sessionflow-server.sh agent-status"
+        ;;
+esac
+
 # --- Done ---
 echo ""
 echo "======================================================================"
@@ -277,6 +302,11 @@ echo "  - Available in all projects automatically"
 echo "  - Dynamic project root via headersHelper"
 echo ""
 echo "Next step: Restart Claude Code to activate"
+echo ""
+echo "Optional autostart (LaunchAgent) commands:"
+echo "  ./sessionflow-server.sh install-agent     # autostart at login"
+echo "  ./sessionflow-server.sh agent-status      # inspect LaunchAgent"
+echo "  ./sessionflow-server.sh uninstall-agent   # remove LaunchAgent"
 echo ""
 echo "See README.md for full documentation."
 echo "======================================================================"

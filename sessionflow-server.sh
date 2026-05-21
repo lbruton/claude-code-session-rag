@@ -3,7 +3,11 @@
 # Starts the server if not running, verifies health.
 # Safe to call multiple times (idempotent).
 #
-# Usage: ./sessionflow-server.sh [start|stop|status|restart]
+# Usage: ./sessionflow-server.sh [start|stop|status|restart|install-agent|uninstall-agent|agent-status]
+#
+# Optional macOS LaunchAgent (install-agent / uninstall-agent / agent-status)
+# autostarts SessionFlow at login before any harness hooks run. The LaunchAgent
+# is OPTIONAL — start/stop/status/restart continue to work standalone.
 
 set -euo pipefail
 
@@ -20,6 +24,13 @@ WATCHDOG_INTERVAL=30
 WATCHDOG_MAX_FAILURES=3
 WATCHDOG_STALE_THRESHOLD=120
 HEARTBEAT_FILE="$SERVER_DIR/heartbeat"
+
+# Optional LaunchAgent (user scope) — autostart at login before harness hooks.
+LAUNCH_AGENT_LABEL="cc.lbruton.sessionflow"
+LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
+LAUNCH_AGENT_PLIST="$LAUNCH_AGENT_DIR/${LAUNCH_AGENT_LABEL}.plist"
+LAUNCH_AGENT_STDOUT="$SERVER_DIR/launchagent.out.log"
+LAUNCH_AGENT_STDERR="$SERVER_DIR/launchagent.err.log"
 
 mkdir -p "$SERVER_DIR"
 
@@ -238,6 +249,118 @@ do_status() {
     fi
 }
 
+# --- Optional LaunchAgent (user scope) ---
+
+# write_launch_agent_plist creates the user LaunchAgent plist that launches this
+# script with `start` at login. It is intentionally minimal: RunAtLoad only, no
+# KeepAlive (the in-process watchdog already restarts unresponsive servers).
+write_launch_agent_plist() {
+    mkdir -p "$LAUNCH_AGENT_DIR"
+    cat > "$LAUNCH_AGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyLists-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LAUNCH_AGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${SCRIPT_DIR}/sessionflow-server.sh</string>
+        <string>start</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- EnvironmentVariables: HOME + PATH only. Custom SessionFlow env
+         (SESSIONFLOW_MILVUS_URI, SESSIONFLOW_PORT, etc.) is NOT propagated
+         here because launchd does not inherit shell env. To set them under
+         the LaunchAgent: either (a) run \`launchctl setenv <KEY> <VAL>\` once
+         before \`install-agent\`, or (b) hand-edit this plist and add the
+         keys below the PATH entry. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${HOME}</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>${LAUNCH_AGENT_STDOUT}</string>
+    <key>StandardErrorPath</key>
+    <string>${LAUNCH_AGENT_STDERR}</string>
+    <key>WorkingDirectory</key>
+    <string>${SCRIPT_DIR}</string>
+</dict>
+</plist>
+PLIST
+}
+
+# launch_agent_target prints the launchctl gui/<uid> domain target for the
+# current user, e.g. "gui/501". Used by bootstrap/bootout/print.
+launch_agent_target() {
+    echo "gui/$(id -u)"
+}
+
+do_install_agent() {
+    if [ ! -x "$SCRIPT_DIR/sessionflow-server.sh" ]; then
+        chmod +x "$SCRIPT_DIR/sessionflow-server.sh"
+    fi
+    local target
+    target=$(launch_agent_target)
+    # If already bootstrapped, bootout first so the new plist takes effect.
+    if launchctl print "${target}/${LAUNCH_AGENT_LABEL}" >/dev/null 2>&1; then
+        launchctl bootout "$target" "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
+    fi
+    write_launch_agent_plist
+    if launchctl bootstrap "$target" "$LAUNCH_AGENT_PLIST" 2>/dev/null; then
+        echo "[sessionflow] LaunchAgent installed at $LAUNCH_AGENT_PLIST" >&2
+        echo "[sessionflow] Bootstrapped into $target" >&2
+    else
+        # bootstrap can fail with "Bootstrap failed: 5: Input/output error" if
+        # the domain already has the label; fall back to enable + kickstart.
+        launchctl enable "${target}/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true
+        launchctl kickstart -k "${target}/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true
+        echo "[sessionflow] LaunchAgent written at $LAUNCH_AGENT_PLIST" >&2
+        echo "[sessionflow] launchctl bootstrap reported a soft failure; tried enable+kickstart." >&2
+        echo "[sessionflow] Verify with: $0 agent-status" >&2
+    fi
+}
+
+do_uninstall_agent() {
+    local target
+    target=$(launch_agent_target)
+    if [ -f "$LAUNCH_AGENT_PLIST" ]; then
+        launchctl bootout "$target" "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
+        rm -f "$LAUNCH_AGENT_PLIST"
+        echo "[sessionflow] LaunchAgent removed ($LAUNCH_AGENT_PLIST)" >&2
+    else
+        # Best-effort bootout by label in case the file was deleted manually.
+        launchctl bootout "${target}/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true
+        echo "[sessionflow] No LaunchAgent plist found at $LAUNCH_AGENT_PLIST" >&2
+    fi
+}
+
+do_agent_status() {
+    local target
+    target=$(launch_agent_target)
+    if [ -f "$LAUNCH_AGENT_PLIST" ]; then
+        echo "[sessionflow] Plist: $LAUNCH_AGENT_PLIST (present)" >&2
+    else
+        echo "[sessionflow] Plist: $LAUNCH_AGENT_PLIST (missing)" >&2
+    fi
+    if launchctl print "${target}/${LAUNCH_AGENT_LABEL}" >/dev/null 2>&1; then
+        echo "[sessionflow] LaunchAgent: loaded in ${target}" >&2
+        # Surface the most useful bits (state + last exit code) without dumping
+        # the entire print payload.
+        launchctl print "${target}/${LAUNCH_AGENT_LABEL}" \
+            | grep -E '^[[:space:]]*(state|last exit code|pid)[[:space:]]*=' \
+            | sed 's/^[[:space:]]*/  /' >&2 || true
+        exit 0
+    else
+        echo "[sessionflow] LaunchAgent: not loaded in ${target}" >&2
+        exit 1
+    fi
+}
+
 case "${1:-start}" in
     start)  do_start ;;
     stop)   do_stop ;;
@@ -246,8 +369,11 @@ case "${1:-start}" in
         do_stop
         do_start
         ;;
+    install-agent)   do_install_agent ;;
+    uninstall-agent) do_uninstall_agent ;;
+    agent-status)    do_agent_status ;;
     *)
-        echo "Usage: $0 {start|stop|status|restart}" >&2
+        echo "Usage: $0 {start|stop|status|restart|install-agent|uninstall-agent|agent-status}" >&2
         exit 1
         ;;
 esac

@@ -24,6 +24,8 @@ import os
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
+from provider_adapters import build_source_id, canonicalize_path
+
 
 def detect_project_root(transcript_path: str, max_lines: int = 30) -> str:
     """Peek at a transcript's first lines to extract the working directory.
@@ -384,7 +386,54 @@ def load_index_state() -> Dict:
             state = {}
 
     _migrate_per_project_states(state)
+    _ensure_provider_cursor_state(state)
     return state
+
+
+def _ensure_provider_cursor_state(state: Dict):
+    """Ensure state has provider-scoped cursor storage plus legacy mirror.
+
+    Existing Claude rows remain under ``transcripts`` for compatibility, while
+    SESF-6 provider-aware code can use ``providers.<provider>.<source_id>``.
+    """
+    state.setdefault("version", 2)
+    state.setdefault("providers", {})
+    state.setdefault("legacy_transcripts", {})
+
+    transcripts = state.get("transcripts", {})
+    claude_cursors = state["providers"].setdefault("claude_code_cli", {})
+    for transcript_path, entry in transcripts.items():
+        if not isinstance(entry, dict):
+            continue
+        legacy_entry = dict(entry)
+        state["legacy_transcripts"].setdefault(transcript_path, legacy_entry)
+        path = Path(transcript_path)
+        logical_session_id = path.stem
+        canonical_path = canonicalize_path(transcript_path)
+        source_id = build_source_id("claude_code_cli", logical_session_id, canonical_path)
+        claude_cursors.setdefault(source_id, {
+            "cursor_type": "byte_offset",
+            "logical_session_id": logical_session_id,
+            "known_paths": [transcript_path],
+            "last_byte_offset": entry.get("last_byte_offset", 0),
+            "last_step_index": 0,
+            "emitted_ids": [],
+            "last_mtime_ns": 0,
+            "project_root": entry.get("project_root", ""),
+            "updated_at": "",
+        })
+
+
+def get_provider_cursor(state: Dict, provider: str, source_id: str) -> Dict:
+    """Return provider cursor state for a source id."""
+    _ensure_provider_cursor_state(state)
+    return state.get("providers", {}).get(provider, {}).get(source_id, {})
+
+
+def set_provider_cursor(state: Dict, provider: str, source_id: str, cursor: Dict):
+    """Set provider cursor state for a source id."""
+    _ensure_provider_cursor_state(state)
+    state["providers"].setdefault(provider, {})[source_id] = cursor
 
 
 def save_index_state(state: Dict):

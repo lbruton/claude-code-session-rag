@@ -12,6 +12,7 @@ Health: curl http://127.0.0.1:7102/health
 
 import asyncio
 import contextlib
+from dataclasses import asdict
 import json
 import logging
 import os
@@ -34,6 +35,13 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 import rag_engine
 import transcript_parser
 import file_watcher
+from backfill_manager import BackfillManager
+from embedding_control import EmbeddingIdentity, get_embedding_budget
+from provider_antigravity import AntigravityAdapter
+from provider_claude import ClaudeCodeCliAdapter, ClaudeDesktopCoworkProbe
+from provider_codex import CodexAdapter
+from provider_opencode import OpenCodeAdapter
+from provider_ingestion import ProviderIngestionService, process_startup_provider_backfill
 from file_watcher import register_project, get_global_watcher
 from tools import register_tools, set_current_project_root
 
@@ -178,9 +186,67 @@ class ProjectMiddleware:
 
 _model_loaded = False
 _server_mode_ready = False
+_BACKFILL_STATE = _SERVER_DIR / "backfill_state.json"
+_backfill_manager = BackfillManager(_BACKFILL_STATE)
+
+# TTL cache for provider health — avoid expensive I/O on every /health probe.
+_PROVIDER_HEALTH_TTL = 30  # seconds
+_provider_health_cache: dict | None = None
+_provider_health_cache_ts: float = 0.0
+
+
+def _provider_health(deep: bool = False) -> dict:
+    global _provider_health_cache, _provider_health_cache_ts
+    now = time.monotonic()
+    if not deep and _provider_health_cache is not None and (now - _provider_health_cache_ts) < _PROVIDER_HEALTH_TTL:
+        return _provider_health_cache
+    providers = [
+        ClaudeCodeCliAdapter(),
+        ClaudeDesktopCoworkProbe(),
+        CodexAdapter(),
+        OpenCodeAdapter(),
+        AntigravityAdapter(source_kind="cli"),
+        AntigravityAdapter(source_kind="desktop"),
+    ]
+    health = {}
+    for provider in providers:
+        try:
+            status = provider.health()
+            health[status.provider] = asdict(status)
+        except Exception as exc:
+            name = getattr(provider, "provider", provider.__class__.__name__)
+            health[name] = {"provider": name, "status": "error", "error": str(exc)}
+    _provider_health_cache = health
+    _provider_health_cache_ts = now
+    return health
+
+
+def _backfill_status_payload() -> dict:
+    status = _backfill_manager.status()
+    return {
+        "paused": status.paused,
+        "jobs": [asdict(job) for job in status.jobs],
+        "providers": {
+            provider: asdict(provider_status)
+            for provider, provider_status in status.providers.items()
+        },
+    }
+
+
+def _embedding_status_payload() -> dict:
+    try:
+        identity = EmbeddingIdentity.current_local()
+        identity_data = asdict(identity)
+    except Exception as exc:
+        identity_data = {"status": "error", "message": str(exc)}
+    return {
+        "identity": identity_data,
+        "budget": get_embedding_budget().status(),
+    }
 
 
 async def health(request: Request) -> JSONResponse:
+    deep = request is not None and request.query_params.get("deep") == "1"
     watchers = file_watcher.get_watcher_status()
     return JSONResponse({
         "status": "ok",
@@ -191,7 +257,63 @@ async def health(request: Request) -> JSONResponse:
         "milvus": _server_mode_ready,
         "milvus_backend": "standalone" if MILVUS_URI.startswith("http") else "lite",
         "watchers": {k: v for k, v in watchers.items()},
+        "providers": _provider_health(deep=deep),
+        "backfill": _backfill_status_payload(),
+        "embedding": _embedding_status_payload(),
     })
+
+
+async def backfill_control_endpoint(request: Request) -> JSONResponse:
+    """Local provider-scoped backfill queue/status controls."""
+    if request.method == "GET":
+        return JSONResponse(_backfill_status_payload())
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    action = body.get("action", "status")
+    provider = body.get("provider")
+    if action == "pause":
+        _backfill_manager.pause(provider=provider)
+    elif action == "resume":
+        _backfill_manager.resume(provider=provider)
+    elif action == "enqueue":
+        if not provider:
+            return JSONResponse({"error": "provider is required for enqueue"}, status_code=400)
+        mode = body.get("mode", "recent")
+        _VALID_MODES = {"recent", "incremental", "full"}
+        if mode not in _VALID_MODES:
+            return JSONResponse(
+                {"detail": f"Invalid mode {mode!r}. Must be one of: {sorted(_VALID_MODES)}"},
+                status_code=400,
+            )
+        raw_limit = body.get("limit")
+        limit: int | None = None
+        if raw_limit is not None:
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"detail": "limit must be an integer"},
+                    status_code=400,
+                )
+        try:
+            priority = int(body.get("priority", 0))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "priority must be an integer"}, status_code=400)
+        _backfill_manager.enqueue_provider_backfill(
+            provider=provider,
+            mode=mode,
+            limit=limit,
+            since=body.get("since", ""),
+            priority=priority,
+        )
+    elif action != "status":
+        return JSONResponse({"error": f"Unknown backfill action: {action}"}, status_code=400)
+
+    return JSONResponse(_backfill_status_payload())
 
 
 # --- Index endpoint (called by hooks) ---
@@ -414,9 +536,22 @@ async def lifespan(app: Starlette):
     try:
         watcher = await file_watcher.start_global_watcher(db_path)
         if watcher:
-            # Full backfill across all projects in background
-            # Delay lets HTTP server finish binding before embedding work starts
-            asyncio.create_task(watcher.backfill(startup_delay=3))
+            enabled_providers = [
+                "claude_code_cli",
+                "codex",
+                "opencode",
+                "antigravity_cli",
+                "antigravity_desktop",
+            ]
+            mode = get_embedding_budget().mode
+            # Delay lets HTTP server finish binding before bounded provider work starts.
+            asyncio.create_task(process_startup_provider_backfill(
+                _backfill_manager,
+                db_path,
+                enabled_providers=enabled_providers,
+                mode=mode,
+                startup_delay=3,
+            ))
     except Exception as e:
         print(f"[HTTP] Warning: Global watcher start failed: {e}", file=sys.stderr)
 
@@ -469,6 +604,7 @@ session_manager = StreamableHTTPSessionManager(
 app = Starlette(
     routes=[
         Route("/health", health, methods=["GET"]),
+        Route("/backfill", backfill_control_endpoint, methods=["GET", "POST"]),
         Route("/index", index_endpoint, methods=["POST"]),
         Route("/watch", watch_endpoint, methods=["POST"]),
         Mount("/mcp", app=ProjectMiddleware(session_manager.handle_request)),
