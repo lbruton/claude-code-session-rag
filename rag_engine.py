@@ -28,7 +28,7 @@ from mlx_embeddings.utils import load as mlx_load, generate as mlx_generate
 import mlx.core as mx
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Optional
+from typing import Iterator, List, Dict, Optional
 import asyncio
 import logging
 import sys
@@ -674,33 +674,46 @@ def get_stats(project_root: Optional[str] = None, db_path: Optional[str] = None)
     }
 
 
+def _query_batches(output_fields: list, batch_size: int = 1000,
+                   filter_expr: Optional[str] = None,
+                   db_path: Optional[str] = None) -> Iterator[list]:
+    """Yield Milvus query_iterator results one batch at a time.
+
+    Uses pymilvus's server-side iterator instead of offset pagination so the
+    full collection is drained regardless of size. The previous implementation
+    hard-capped at 16,384 rows, silently truncating any collection larger than
+    that — see SESF-4.
+    """
+    with milvus_client(db_path) as client:
+        if not client.has_collection(COLLECTION_NAME):
+            return
+        iterator = client.query_iterator(
+            collection_name=COLLECTION_NAME,
+            batch_size=batch_size,
+            filter=filter_expr or "",
+            output_fields=output_fields,
+        )
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                yield batch
+        finally:
+            iterator.close()
+
+
 def _query_all(output_fields: list, batch_size: int = 1000,
                filter_expr: Optional[str] = None,
                db_path: Optional[str] = None) -> list:
-    """Query all rows with offset pagination. Optional filter expression."""
-    MILVUS_MAX = 16384
+    """Query all rows via Milvus query_iterator. Optional filter expression.
+
+    Keeps the public list-returning behavior for callers that need aggregate
+    results while allowing streaming callers to use _query_batches directly.
+    """
     all_results = []
-    offset = 0
-
-    with milvus_client(db_path) as client:
-        if not client.has_collection(COLLECTION_NAME):
-            return []
-        while offset < MILVUS_MAX:
-            effective_limit = min(batch_size, MILVUS_MAX - offset)
-            batch = client.query(
-                collection_name=COLLECTION_NAME,
-                filter=filter_expr or "",
-                limit=effective_limit,
-                offset=offset,
-                output_fields=output_fields,
-            )
-            if not batch:
-                break
-            all_results.extend(batch)
-            if len(batch) < effective_limit:
-                break
-            offset += effective_limit
-
+    for batch in _query_batches(output_fields, batch_size, filter_expr, db_path):
+        all_results.extend(batch)
     return all_results
 
 
@@ -813,66 +826,63 @@ def backfill_fts(db_path: Optional[str] = None) -> int:
     if not db_path:
         return 0
 
-    # Pass 1: doc_ids only
-    id_rows = _query_all(["doc_id"], db_path=db_path)
-    if not id_rows:
-        return 0
-
-    all_doc_ids = [r.get("doc_id", "") for r in id_rows if r.get("doc_id", "")]
-    if not all_doc_ids:
-        return 0
-
     fts_conn = _fts.connection(db_path)
     try:
-        # Diff against FTS in chunks (SQLite default param limit is 999).
-        existing = set()
-        BATCH_DIFF = 500
-        for i in range(0, len(all_doc_ids), BATCH_DIFF):
-            chunk = all_doc_ids[i:i + BATCH_DIFF]
-            placeholders = ",".join("?" for _ in chunk)
-            rows = fts_conn.execute(
-                f"SELECT doc_id FROM {_fts.table_name} WHERE doc_id IN ({placeholders})",
-                chunk,
-            ).fetchall()
-            for row in rows:
-                existing.add(row[0])
-
-        missing_doc_ids = [d for d in all_doc_ids if d not in existing]
-        if not missing_doc_ids:
-            return 0
-
-        # Pass 2: hydrate missing rows in small batches.
+        # Pass 2: hydrate missing rows in small batches and stream into FTS
+        # one batch at a time so peak memory stays at O(BATCH_FETCH) regardless
+        # of how many rows are missing — see SESF-5.
         output_fields = ["doc_id", "document", "session_id", "git_branch",
                          "turn_index", "timestamp", "chunk_type", "project_root"]
         BATCH_FETCH = 100
-        records = []
+        inserted = 0
+
         with milvus_client(db_path) as client:
-            for i in range(0, len(missing_doc_ids), BATCH_FETCH):
-                chunk = missing_doc_ids[i:i + BATCH_FETCH]
-                ids_quoted = ", ".join(json.dumps(d) for d in chunk)
-                batch = client.query(
-                    collection_name=COLLECTION_NAME,
-                    filter=f"doc_id in [{ids_quoted}]",
-                    limit=len(chunk),
-                    output_fields=output_fields,
-                )
-                for r in batch:
-                    records.append({
-                        "doc_id": r["doc_id"],
-                        "content": r.get("document", ""),
-                        "session_id": r.get("session_id", ""),
-                        "git_branch": r.get("git_branch", ""),
-                        "turn_index": r.get("turn_index", 0),
-                        "timestamp": r.get("timestamp", ""),
-                        "chunk_type": r.get("chunk_type", "turn"),
-                        "project_root": r.get("project_root", ""),
-                    })
+            def hydrate_and_insert(doc_ids: list) -> None:
+                nonlocal inserted
+                for i in range(0, len(doc_ids), BATCH_FETCH):
+                    fetch_chunk = doc_ids[i:i + BATCH_FETCH]
+                    ids_quoted = ", ".join(json.dumps(d) for d in fetch_chunk)
+                    batch = client.query(
+                        collection_name=COLLECTION_NAME,
+                        filter=f"doc_id in [{ids_quoted}]",
+                        limit=len(fetch_chunk),
+                        output_fields=output_fields,
+                    )
+                    records = [
+                        {
+                            "doc_id": r["doc_id"],
+                            "content": r.get("document", ""),
+                            "session_id": r.get("session_id", ""),
+                            "git_branch": r.get("git_branch", ""),
+                            "turn_index": r.get("turn_index", 0),
+                            "timestamp": r.get("timestamp", ""),
+                            "chunk_type": r.get("chunk_type", "turn"),
+                            "project_root": r.get("project_root", ""),
+                        }
+                        for r in batch
+                    ]
+                    if records:
+                        _fts.insert(fts_conn, records)
+                        inserted += len(records)
 
-        if records:
-            _fts.insert(fts_conn, records)
+            # Diff against FTS in bounded chunks, then hydrate each chunk before
+            # moving on so missing doc IDs never grow with collection size.
+            for batch in _query_batches(["doc_id"], batch_size=500, db_path=db_path):
+                chunk = [r.get("doc_id", "") for r in batch if r.get("doc_id", "")]
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" for _ in chunk)
+                rows = fts_conn.execute(
+                    f"SELECT doc_id FROM {_fts.table_name} WHERE doc_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                existing = {row[0] for row in rows}
+                missing_doc_ids = [d for d in chunk if d not in existing]
+                if missing_doc_ids:
+                    hydrate_and_insert(missing_doc_ids)
 
-        logger.info("FTS backfill: inserted %d records", len(records))
-        return len(records)
+        logger.info("FTS backfill: inserted %d records", inserted)
+        return inserted
     finally:
         _fts.close_ephemeral(fts_conn)
 
