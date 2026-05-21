@@ -51,6 +51,8 @@ def format_results(results: list[dict]) -> str:
         turn_index = r.get("turn_index", 0)
 
         project = r.get("project_root", "")
+        provider = r.get("provider", "")
+        source_kind = r.get("source_kind", "")
 
         header_parts = [f"**Result {i}**"]
         if ts:
@@ -59,6 +61,10 @@ def format_results(results: list[dict]) -> str:
             header_parts.append(f"[{branch}]")
         if project:
             header_parts.append(f"project:{Path(project).name}")
+        if provider:
+            header_parts.append(f"provider:{provider}")
+        if source_kind:
+            header_parts.append(f"source:{source_kind}")
         if session_id:
             header_parts.append(f"session:{session_id}")
 
@@ -119,11 +125,58 @@ def format_stats(stats: dict, db_path: str) -> str:
         for t, count in sorted(stats["by_type"].items(), key=lambda x: x[1], reverse=True):
             lines.append(f"- {t}: {count}")
 
+    if stats.get("providers"):
+        lines.append("\n### Providers")
+        for provider, count in sorted(stats["providers"].items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"- {provider}: {count}")
+
     lines.append(f"\n**Index Location:** {db_path}")
     return "\n".join(lines)
 
 
 # --- Tool registration ---
+
+
+def build_search_all_sessions_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Natural language search query",
+            },
+            "n": {
+                "type": "integer",
+                "description": "Number of results to return (default: 10)",
+                "default": 10,
+            },
+            "git_branch": {
+                "type": "string",
+                "description": "Filter by git branch name (e.g., 'develop', 'feature/my-feature')",
+            },
+            "project_root": {
+                "type": "string",
+                "description": "Filter to a specific project path, or '*' for all projects. Default: current project.",
+            },
+            "provider": {
+                "type": "string",
+                "description": "Optional provider filter (e.g., codex, opencode, antigravity_cli)",
+            },
+            "source_kind": {
+                "type": "string",
+                "description": "Optional provider source-kind filter (e.g., codex_rollout_jsonl)",
+            },
+            "date_from": {
+                "type": "string",
+                "description": "ISO date lower bound, inclusive (e.g., '2026-04-02'). Only returns turns on or after this date.",
+            },
+            "date_to": {
+                "type": "string",
+                "description": "ISO date upper bound, inclusive (e.g., '2026-04-02'). Only returns turns on or before this date.",
+            },
+        },
+        "required": ["query"],
+    }
 
 def register_tools(server: Server):
     """Register SessionFlow MCP tools."""
@@ -164,37 +217,7 @@ def register_tools(server: Server):
                     "Search across ALL past conversation sessions. Pure semantic search "
                     "without recency bias. Optionally filter by git branch or date range."
                 ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Natural language search query",
-                        },
-                        "n": {
-                            "type": "integer",
-                            "description": "Number of results to return (default: 10)",
-                            "default": 10,
-                        },
-                        "git_branch": {
-                            "type": "string",
-                            "description": "Filter by git branch name (e.g., 'develop', 'feature/my-feature')",
-                        },
-                        "project_root": {
-                            "type": "string",
-                            "description": "Filter to a specific project path, or '*' for all projects. Default: current project.",
-                        },
-                        "date_from": {
-                            "type": "string",
-                            "description": "ISO date lower bound, inclusive (e.g., '2026-04-02'). Only returns turns on or after this date.",
-                        },
-                        "date_to": {
-                            "type": "string",
-                            "description": "ISO date upper bound, inclusive (e.g., '2026-04-02'). Only returns turns on or before this date.",
-                        },
-                    },
-                    "required": ["query"],
-                },
+                inputSchema=build_search_all_sessions_schema(),
             ),
             types.Tool(
                 name="get_turns",
@@ -299,6 +322,8 @@ def register_tools(server: Server):
                     recency_boost=False,
                     date_from=arguments.get("date_from"),
                     date_to=arguments.get("date_to"),
+                    provider=arguments.get("provider"),
+                    source_kind=arguments.get("source_kind"),
                     db_path=db,
                 )
                 return [types.TextContent(type="text", text=format_results(results))]

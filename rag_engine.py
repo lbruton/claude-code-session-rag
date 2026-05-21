@@ -35,6 +35,8 @@ import sys
 import time
 
 from fts_hybrid import FTSIndex, rrf_merge
+from embedding_control import EmbeddingIdentity, get_embedding_budget
+from provider_adapters import default_provider_metadata
 
 logger = logging.getLogger("sessionflow.milvus")
 
@@ -130,6 +132,18 @@ def get_model_name() -> str:
     """Return the active model's short name (e.g. 'modernbert', 'embeddinggemma')."""
     return _MODEL_NAME
 
+
+def get_embedding_identity() -> Dict[str, object]:
+    """Return the active local embedding identity for health/status output."""
+    identity = EmbeddingIdentity.current_local()
+    return {
+        "embedding_provider": identity.embedding_provider,
+        "model_name": identity.model_name,
+        "dimension": identity.dimension,
+        "collection_name": identity.collection_name,
+        "created_at": identity.created_at,
+    }
+
 _mlx_model = None
 _mlx_tokenizer = None
 
@@ -186,7 +200,11 @@ def embed_texts(texts: List[str], is_query: bool = False) -> List[List[float]]:
 # --- Milvus client management ---
 
 _persistent_clients: Dict[str, MilvusClient] = {}
-_fts = FTSIndex("turns_fts", ["session_id", "git_branch", "turn_index", "timestamp", "chunk_type", "project_root"])
+_fts = FTSIndex("turns_fts", [
+    "session_id", "git_branch", "turn_index", "timestamp", "chunk_type",
+    "project_root", "logical_session_id", "provider", "source_kind",
+    "source_class", "source_id",
+])
 _write_lock: Optional[asyncio.Lock] = None
 _embed_semaphore: Optional[asyncio.Semaphore] = None
 # Dedicated single-worker executor so every MLX/Metal call runs on the same OS
@@ -288,6 +306,12 @@ def _ensure_collection(client: MilvusClient, db_path: str = ""):
         FieldSchema(name="document", dtype=DataType.VARCHAR, max_length=65535),
         FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=512),
         FieldSchema(name="session_id", dtype=DataType.VARCHAR, max_length=128),
+        FieldSchema(name="logical_session_id", dtype=DataType.VARCHAR, max_length=256),
+        FieldSchema(name="provider", dtype=DataType.VARCHAR, max_length=64),
+        FieldSchema(name="source_kind", dtype=DataType.VARCHAR, max_length=96),
+        FieldSchema(name="source_class", dtype=DataType.VARCHAR, max_length=32),
+        FieldSchema(name="source_id", dtype=DataType.VARCHAR, max_length=512),
+        FieldSchema(name="source_path", dtype=DataType.VARCHAR, max_length=1024),
         FieldSchema(name="transcript_file", dtype=DataType.VARCHAR, max_length=512),
         FieldSchema(name="turn_index", dtype=DataType.INT64),
         FieldSchema(name="timestamp", dtype=DataType.VARCHAR, max_length=64),
@@ -377,12 +401,43 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
     if not new_turns:
         return 0
 
-    # Embed texts
-    texts = [t["text"] for t in new_turns]
-    embeddings = embed_texts(texts, is_query=False)
+    # Embed texts in local, resource-controlled batches. Query embedding stays
+    # untouched in search(); this path is ingestion/backfill only.
+    budget = get_embedding_budget()
+    all_embeddings = []
+    for batch in budget.split_batches(new_turns):
+        texts = [t["text"] for t in batch]
+        decision = budget.before_batch(
+            batch_size=len(batch),
+            estimated_chars=sum(len(t) for t in texts),
+        )
+        if not decision.allowed and decision.retry_after_seconds > 0:
+            time.sleep(decision.retry_after_seconds)
+            decision = budget.before_batch(
+                batch_size=len(batch),
+                estimated_chars=sum(len(t) for t in texts),
+            )
+        if not decision.allowed:
+            logger.info("Embedding batch deferred: %s", decision.reason)
+            break
+
+        started = time.monotonic()
+        try:
+            embeddings = embed_texts(texts, is_query=False)
+        except Exception as e:
+            budget.after_batch(time.monotonic() - started, 0, error=e)
+            raise
+        budget.after_batch(time.monotonic() - started, len(batch))
+        all_embeddings.extend(embeddings)
+
+    new_turns = new_turns[:len(all_embeddings)]
+    embeddings = all_embeddings
+    if not new_turns:
+        return 0
 
     data = []
     for turn, emb in zip(new_turns, embeddings):
+        provider_defaults = default_provider_metadata()
         # Stable hash: SHA-256 truncated to int64. Python's hash() is
         # randomized per process, so the same doc_id would get different
         # primary keys across server restarts.
@@ -393,6 +448,12 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
             "document": turn["text"][:65535],
             "doc_id": turn["doc_id"],
             "session_id": turn.get("session_id", ""),
+            "logical_session_id": turn.get("logical_session_id", turn.get("session_id", "")),
+            "provider": turn.get("provider", provider_defaults["provider"]),
+            "source_kind": turn.get("source_kind", provider_defaults["source_kind"]),
+            "source_class": turn.get("source_class", provider_defaults["source_class"]),
+            "source_id": turn.get("source_id", ""),
+            "source_path": turn.get("source_path", turn.get("transcript_file", "")),
             "transcript_file": turn.get("transcript_file", ""),
             "turn_index": turn.get("turn_index", 0),
             "timestamp": turn.get("timestamp", ""),
@@ -412,6 +473,11 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
                 "doc_id": t["doc_id"],
                 "content": t["text"],
                 "session_id": t.get("session_id", ""),
+                "logical_session_id": t.get("logical_session_id", t.get("session_id", "")),
+                "provider": t.get("provider", default_provider_metadata()["provider"]),
+                "source_kind": t.get("source_kind", default_provider_metadata()["source_kind"]),
+                "source_class": t.get("source_class", default_provider_metadata()["source_class"]),
+                "source_id": t.get("source_id", ""),
                 "git_branch": t.get("git_branch", ""),
                 "turn_index": t.get("turn_index", 0),
                 "timestamp": t.get("timestamp", ""),
@@ -430,6 +496,7 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
            git_branch: Optional[str] = None, project_root: Optional[str] = None,
            recency_boost: bool = False,
            date_from: Optional[str] = None, date_to: Optional[str] = None,
+           provider: Optional[str] = None, source_kind: Optional[str] = None,
            db_path: Optional[str] = None) -> List[Dict]:
     """Hybrid search: vector similarity + FTS5 keyword search, merged with RRF.
 
@@ -454,6 +521,10 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
         filters.append(f'git_branch == "{git_branch}"')
     if project_root:
         filters.append(f'project_root == "{project_root}"')
+    if provider:
+        filters.append(f'provider == "{provider}"')
+    if source_kind:
+        filters.append(f'source_kind == "{source_kind}"')
     if date_from:
         filters.append(f'timestamp >= "{date_from}"')
     if date_to:
@@ -473,17 +544,25 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
             search_params=search_params,
             output_fields=["document", "doc_id", "session_id", "transcript_file",
                            "turn_index", "timestamp", "git_branch", "chunk_type",
-                           "project_root"],
+                           "project_root", "logical_session_id", "provider",
+                           "source_kind", "source_class", "source_id", "source_path"],
         )
 
     vector_results = []
     if results and results[0]:
         for hit in results[0]:
             entity = hit["entity"]
+            provider_defaults = default_provider_metadata()
             vector_results.append({
                 "content": entity["document"],
                 "doc_id": entity.get("doc_id", ""),
                 "session_id": entity.get("session_id", ""),
+                "logical_session_id": entity.get("logical_session_id", entity.get("session_id", "")),
+                "provider": entity.get("provider", provider_defaults["provider"]),
+                "source_kind": entity.get("source_kind", provider_defaults["source_kind"]),
+                "source_class": entity.get("source_class", provider_defaults["source_class"]),
+                "source_id": entity.get("source_id", ""),
+                "source_path": entity.get("source_path", entity.get("transcript_file", "")),
                 "transcript_file": entity.get("transcript_file", ""),
                 "turn_index": entity.get("turn_index", 0),
                 "timestamp": entity.get("timestamp", ""),
@@ -501,6 +580,10 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
         fts_filters["git_branch"] = git_branch
     if project_root:
         fts_filters["project_root"] = project_root
+    if provider:
+        fts_filters["provider"] = provider
+    if source_kind:
+        fts_filters["source_kind"] = source_kind
     if date_from:
         fts_filters["timestamp_gte"] = (">=", date_from)
     if date_to:
@@ -522,6 +605,11 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
     # Clean up internal RRF score before recency boost
     for r in merged:
         r.pop("_rrf_score", None)
+        defaults = default_provider_metadata()
+        r.setdefault("provider", defaults["provider"])
+        r.setdefault("source_kind", defaults["source_kind"])
+        r.setdefault("source_class", defaults["source_class"])
+        r.setdefault("logical_session_id", r.get("session_id", ""))
 
     if recency_boost and merged:
         merged = _apply_recency_boost(merged, n)
@@ -605,7 +693,9 @@ def get_turns(session_id: str, turn_index: int, context: int = 2,
             collection_name=COLLECTION_NAME,
             filter=f'session_id == "{session_id}"',
             output_fields=["document", "doc_id", "session_id", "transcript_file",
-                           "turn_index", "timestamp", "git_branch", "chunk_type"],
+                           "turn_index", "timestamp", "git_branch", "chunk_type",
+                           "logical_session_id", "provider", "source_kind",
+                           "source_class", "source_id", "source_path"],
             limit=16384,
         )
 
@@ -634,6 +724,12 @@ def get_turns(session_id: str, turn_index: int, context: int = 2,
             "content": row["document"],
             "doc_id": row.get("doc_id", ""),
             "session_id": row.get("session_id", ""),
+            "logical_session_id": row.get("logical_session_id", row.get("session_id", "")),
+            "provider": row.get("provider", default_provider_metadata()["provider"]),
+            "source_kind": row.get("source_kind", default_provider_metadata()["source_kind"]),
+            "source_class": row.get("source_class", default_provider_metadata()["source_class"]),
+            "source_id": row.get("source_id", ""),
+            "source_path": row.get("source_path", row.get("transcript_file", "")),
             "transcript_file": row.get("transcript_file", ""),
             "turn_index": row.get("turn_index", 0),
             "timestamp": row.get("timestamp", ""),
@@ -648,11 +744,11 @@ def get_stats(project_root: Optional[str] = None, db_path: Optional[str] = None)
     """Get index statistics. Optionally filter to a specific project."""
     with milvus_client(db_path) as client:
         if not client.has_collection(COLLECTION_NAME):
-            return {"total_turns": 0, "sessions": 0, "by_type": {}}
+            return {"total_turns": 0, "sessions": 0, "by_type": {}, "providers": {}}
 
     # Query for breakdowns (capped by Milvus offset limit)
     all_results = _query_all(
-        ["session_id", "chunk_type", "git_branch", "project_root"],
+        ["session_id", "chunk_type", "git_branch", "project_root", "provider"],
         filter_expr=f'project_root == "{project_root}"' if project_root else None,
         db_path=db_path,
     )
@@ -662,15 +758,20 @@ def get_stats(project_root: Optional[str] = None, db_path: Optional[str] = None)
     branches = set(r["git_branch"] for r in all_results if r.get("git_branch"))
 
     by_type = {}
+    providers = {}
+    defaults = default_provider_metadata()
     for r in all_results:
         t = r.get("chunk_type", "unknown")
         by_type[t] = by_type.get(t, 0) + 1
+        provider_name = r.get("provider", defaults["provider"])
+        providers[provider_name] = providers.get(provider_name, 0) + 1
 
     return {
         "total_turns": total,
         "sessions": len(sessions),
         "branches": sorted(branches),
         "by_type": by_type,
+        "providers": providers,
     }
 
 
@@ -832,7 +933,9 @@ def backfill_fts(db_path: Optional[str] = None) -> int:
         # one batch at a time so peak memory stays at O(BATCH_FETCH) regardless
         # of how many rows are missing — see SESF-5.
         output_fields = ["doc_id", "document", "session_id", "git_branch",
-                         "turn_index", "timestamp", "chunk_type", "project_root"]
+                         "turn_index", "timestamp", "chunk_type", "project_root",
+                         "logical_session_id", "provider", "source_kind",
+                         "source_class", "source_id"]
         BATCH_FETCH = 100
         inserted = 0
 
@@ -853,6 +956,11 @@ def backfill_fts(db_path: Optional[str] = None) -> int:
                             "doc_id": r["doc_id"],
                             "content": r.get("document", ""),
                             "session_id": r.get("session_id", ""),
+                            "logical_session_id": r.get("logical_session_id", r.get("session_id", "")),
+                            "provider": r.get("provider", default_provider_metadata()["provider"]),
+                            "source_kind": r.get("source_kind", default_provider_metadata()["source_kind"]),
+                            "source_class": r.get("source_class", default_provider_metadata()["source_class"]),
+                            "source_id": r.get("source_id", ""),
                             "git_branch": r.get("git_branch", ""),
                             "turn_index": r.get("turn_index", 0),
                             "timestamp": r.get("timestamp", ""),
@@ -948,6 +1056,7 @@ def list_sessions(project_root: Optional[str] = None,
 async def search_async(query: str, n: int = 5, session_id: Optional[str] = None,
                        git_branch: Optional[str] = None, project_root: Optional[str] = None,
                        recency_boost: bool = False,
+                       provider: Optional[str] = None, source_kind: Optional[str] = None,
                        db_path: Optional[str] = None) -> List[Dict]:
     """Async search with embed semaphore."""
     loop = asyncio.get_event_loop()
@@ -960,10 +1069,22 @@ async def search_async(query: str, n: int = 5, session_id: Optional[str] = None,
     if semaphore is not None:
         async with semaphore:
             return await loop.run_in_executor(
-                executor, lambda: search(query, n, session_id, git_branch, project_root, recency_boost, db_path))
+                executor,
+                lambda: search(
+                    query, n, session_id=session_id, git_branch=git_branch,
+                    project_root=project_root, recency_boost=recency_boost,
+                    provider=provider, source_kind=source_kind, db_path=db_path,
+                ),
+            )
     else:
         return await loop.run_in_executor(
-            None, lambda: search(query, n, session_id, git_branch, project_root, recency_boost, db_path))
+            None,
+            lambda: search(
+                query, n, session_id=session_id, git_branch=git_branch,
+                project_root=project_root, recency_boost=recency_boost,
+                provider=provider, source_kind=source_kind, db_path=db_path,
+            ),
+        )
 
 
 async def add_turns_async(turns: List[Dict], db_path: Optional[str] = None) -> int:

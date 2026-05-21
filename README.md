@@ -72,6 +72,107 @@ search_session("the milvus migration", session_id="<CLAUDE_SESSION_ID>")
 curl http://127.0.0.1:7102/health # Health check
 ```
 
+### Optional macOS LaunchAgent (autostart at login)
+
+When several harnesses (Claude Code, Codex, OpenCode, Antigravity CLI) launch
+at the same time, their `SessionStart` hooks race to start the server. The
+optional user LaunchAgent starts SessionFlow at login *before* any hook fires,
+so every harness simply attaches to an already-running server.
+
+```bash
+./sessionflow-server.sh install-agent     # write & bootstrap ~/Library/LaunchAgents/cc.lbruton.sessionflow.plist
+./sessionflow-server.sh agent-status      # show plist + launchctl state
+./sessionflow-server.sh uninstall-agent   # bootout + remove plist
+```
+
+The LaunchAgent is OPTIONAL — `start`/`stop`/`restart`/`status` behavior is
+unchanged whether it is installed or not. `setup.sh` will offer to install it
+interactively, or non-interactively when `SESSIONFLOW_INSTALL_AGENT=1`.
+
+## Provider support matrix
+
+SessionFlow ingests sessions from multiple coding agents. Native structured
+sources are preferred; terminal/log fallbacks are not used in this release.
+
+| Provider | Status | Source kind | Notes |
+|----------|--------|-------------|-------|
+| `claude_code_cli` | Searchable | `claude_code_jsonl` (`~/.claude/projects/**/*.jsonl`) | Original SessionFlow source. Watcher + backfill both supported. |
+| `claude_desktop_cowork` | Probe only | `claude_desktop_sessions` (`~/Library/Application Support/Claude/claude-code-sessions/**/local_*.json`) | Discovery surfaces files in health/status output. Full turn-content ingestion deferred pending a parser spike. |
+| `codex` | Searchable | `codex_rollout_jsonl` | Native rollout JSONL; provider-tagged. |
+| `opencode` | Searchable | `opencode_storage` | Native storage; provider-tagged. |
+| `antigravity_cli` | Searchable | `antigravity_cli_transcript_jsonl` (`brain/<id>/.system_generated/logs/transcript.jsonl`) | Authoritative source per discovery. Sibling `.pb` artifacts are NOT parsed in this release. |
+| `antigravity_desktop` | Searchable | `antigravity_desktop_transcript_jsonl` | Desktop/IDE transcript JSONL. Source kind is distinguished from `antigravity_cli` in diagnostics. |
+
+### Antigravity migration paths
+
+Antigravity is the successor to Gemini CLI. SessionFlow treats legacy Gemini
+CLI artifacts as migration context only:
+
+- `antigravity_cli` ingests `brain/<id>/.system_generated/logs/transcript.jsonl`.
+  Sibling `.pb` (protobuf) artifacts are opaque without a stable schema and are
+  not parsed in this release.
+- `antigravity_desktop` ingests desktop/IDE transcript JSONL.
+- Legacy Gemini CLI history (`legacy_gemini_history`) is recognized as a
+  source-kind constant for one-time import work but is not auto-ingested.
+
+### Claude Desktop / CoWork
+
+`~/Library/Application Support/Claude/claude-code-sessions/**/local_*.json`
+files are discovered and reported in health/status output, but full turn
+content is not yet indexed — a parser spike is required before claiming
+searchable support. Treat it as **probe-only** for now.
+
+## Local resource controls (embedding budget)
+
+All embedding work in SessionFlow is local MLX (EmbeddingGemma-300M). Backfill
+respects a configurable budget so long historical imports cannot saturate the
+GPU. See `embedding_control.py` for the authoritative list.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SESSIONFLOW_EMBED_BATCH_SIZE` | `16` | Max turns embedded per batch. |
+| `SESSIONFLOW_EMBED_COOLDOWN_MS` | `200` | Sleep between batches. **Hard floor of 200ms** — MLX Metal driver SIGSEGVs under sustained load below this. |
+| `SESSIONFLOW_BACKFILL_MAX_TURNS_PER_RUN` | `200` | Max turns embedded per backfill invocation. |
+| `SESSIONFLOW_BACKFILL_MAX_FILES_PER_RUN` | `100` | Max source files visited per backfill invocation. |
+| `SESSIONFLOW_BACKFILL_RECENT_DAYS` | `14` | Window for `recent` mode. |
+| `SESSIONFLOW_BACKFILL_MODE` | `recent` | One of `recent`, `incremental`, `full`. |
+| `SESSIONFLOW_BACKFILL_PAUSED` | unset | If truthy at startup, backfill begins paused. |
+
+### Backfill modes and pause/resume
+
+Backfill is provider-aware and durable across restarts (queue state lives in
+SessionFlow's index state directory). Modes:
+
+- `recent` — only sources modified in the last `SESSIONFLOW_BACKFILL_RECENT_DAYS`.
+  This is the default so the most useful recall lands first.
+- `incremental` — pick up from the last cursor for each source; no rescans.
+- `full` — exhaustive backfill across all sources for the provider. Use
+  sparingly; runs are still bounded by the per-run turn/file caps above.
+
+Maintenance commands (see `cleanup.py`):
+
+```bash
+python cleanup.py status                          # provider + embedding + backfill snapshot
+python cleanup.py status --provider codex         # per-provider view
+python cleanup.py backfill status                 # queue status
+python cleanup.py backfill pause                  # pause all providers
+python cleanup.py backfill pause --provider codex # pause one provider
+python cleanup.py backfill resume                 # resume all
+python cleanup.py backfill enqueue --provider antigravity_cli --mode recent
+```
+
+Pause state and queued jobs persist on disk, so a restart (or LaunchAgent
+re-launch) resumes the same plan.
+
+## Hosted embeddings — deferred
+
+Hosted/OpenAI embeddings are **deferred and not implemented in SESF-6**.
+SessionFlow remains self-hosted: all embedding runs through local MLX. The
+provider/identity layer leaves room for a future opt-in hosted path, but no
+hosted setup steps, credentials, or collections are created by this release.
+If local resource controls prove insufficient for your workload, hosted
+embeddings will be tracked as a separate future issue.
+
 ## Key features
 
 - **Hybrid search** — vector similarity (Milvus) + keyword matching (FTS5), merged with Reciprocal Rank Fusion

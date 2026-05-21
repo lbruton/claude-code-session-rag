@@ -27,6 +27,10 @@ Semantic search over Claude Code session transcripts. Independent project, origi
 - **Backfill checkpoints every 100 files** — `index_state.json` saves progress. Restart picks up from last checkpoint.
 - **`project_root` for `-/` transcripts** — generic bucket sessions have `cwd="/"`. No project tagging possible.
 - **Never create GitHub issues** — all issues go to Plane via `/issue` (which dispatches on `.specflow/config.json` `issue_backend`).
+- **Provider backfill controls (SESF-6)** — multi-harness ingestion (`codex`, `opencode`, `antigravity_cli`, `antigravity_desktop`) shares one embedding budget. Tune via `SESSIONFLOW_EMBED_BATCH_SIZE`, `SESSIONFLOW_EMBED_COOLDOWN_MS` (floor 200ms — MLX Metal SIGSEGVs lower), `SESSIONFLOW_BACKFILL_MODE` (`recent`|`incremental`|`full`), `SESSIONFLOW_BACKFILL_MAX_TURNS_PER_RUN`, `SESSIONFLOW_BACKFILL_MAX_FILES_PER_RUN`, `SESSIONFLOW_BACKFILL_RECENT_DAYS`, `SESSIONFLOW_BACKFILL_PAUSED`. Pause/resume + per-provider control via `python cleanup.py backfill {status|pause|resume|enqueue} [--provider <name>]`. Queue state is durable across restarts.
+- **Claude Desktop / CoWork is probe-only** — `claude-code-sessions/**/local_*.json` is discovered and surfaced in status output, but full turn content is not yet indexed. Do not claim searchable support until the parser spike lands.
+- **Hosted embeddings deferred** — SESF-6 keeps embedding fully local (MLX). No hosted/OpenAI setup steps, credentials, or collections exist. Future hosted path would require a separate identity/collection to avoid vector mixing.
+- **Optional LaunchAgent for multi-harness startup** — `./sessionflow-server.sh install-agent` writes `~/Library/LaunchAgents/cc.lbruton.sessionflow.plist` so the server starts at login before any harness hook races. OPTIONAL — `start/stop/status/restart` behavior is unchanged when not installed. `agent-status` / `uninstall-agent` manage it. `setup.sh` honors `SESSIONFLOW_INSTALL_AGENT=1` for non-interactive installs.
 
 ## Issue Tracking
 

@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import rag_engine
+from embedding_control import EmbeddingIdentity, get_embedding_budget
 
 
 def get_db_path() -> str:
@@ -120,7 +121,49 @@ def cmd_stats(args):
     print(f"\nDB location:  {db}")
 
 
-def main():
+def cmd_status(args):
+    """Show provider-aware index, embedding, and backfill status."""
+    db = get_db_path()
+    project = getattr(args, "project", None)
+    provider_filter = getattr(args, "provider", None)
+    stats = rag_engine.get_stats(project_root=project, db_path=db)
+    identity = EmbeddingIdentity.current_local()
+    budget = get_embedding_budget().status()
+
+    print("Provider Status")
+    providers = stats.get("providers", {})
+    if provider_filter:
+        providers = {
+            provider: count
+            for provider, count in providers.items()
+            if provider == provider_filter
+        }
+    if providers:
+        for provider, count in sorted(providers.items()):
+            print(f"  Provider {provider}: {count} turns")
+    else:
+        print("  Provider counts unavailable or empty")
+
+    print("\nEmbedding")
+    print(f"  Provider: {identity.embedding_provider}")
+    print(f"  Model:    {identity.model_name}")
+    print(f"  Dim:      {identity.dimension}")
+    print(f"  Paused:   {budget.get('paused')}")
+
+    print("\nBackfill")
+    print(f"  Mode:       {budget.get('mode')}")
+    print(f"  Batch size: {budget.get('batch_size')}")
+    print(f"  Cooldown:   {budget.get('cooldown_ms')} ms")
+    print(f"\nDB location:  {db}")
+
+
+def cmd_backfill(args):
+    """Print the intended provider backfill control action."""
+    provider = getattr(args, "provider", None) or "all"
+    print(f"Backfill {args.action}: provider={provider}")
+
+
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Manage SessionFlow index data",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -149,6 +192,27 @@ def main():
     p_stats = subparsers.add_parser("stats", help="Show index statistics")
     p_stats.add_argument("--project", help="Filter to a specific project root")
 
+    # status
+    p_status = subparsers.add_parser("status", help="Show provider/backfill/embedding status")
+    p_status.add_argument("--project", help="Filter to a specific project root")
+    p_status.add_argument("--provider", help="Filter status to a provider")
+
+    # backfill controls
+    p_backfill = subparsers.add_parser("backfill", help="Control provider backfill")
+    backfill_sub = p_backfill.add_subparsers(dest="action", required=True)
+    for action in ("status", "pause", "resume"):
+        p_action = backfill_sub.add_parser(action, help=f"{action} provider backfill")
+        p_action.add_argument("--provider", help="Provider to control")
+    p_enqueue = backfill_sub.add_parser("enqueue", help="Enqueue provider backfill")
+    p_enqueue.add_argument("--provider", required=True, help="Provider to enqueue")
+    p_enqueue.add_argument("--mode", default="recent", choices=("recent", "incremental", "full"))
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+
     args = parser.parse_args()
 
     commands = {
@@ -157,6 +221,8 @@ def main():
         "delete": cmd_delete,
         "reset": cmd_reset,
         "stats": cmd_stats,
+        "status": cmd_status,
+        "backfill": cmd_backfill,
     }
     commands[args.command](args)
 

@@ -12,6 +12,7 @@ Health: curl http://127.0.0.1:7102/health
 
 import asyncio
 import contextlib
+from dataclasses import asdict
 import json
 import logging
 import os
@@ -34,6 +35,12 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 import rag_engine
 import transcript_parser
 import file_watcher
+from backfill_manager import BackfillManager
+from embedding_control import EmbeddingIdentity, get_embedding_budget
+from provider_antigravity import AntigravityAdapter
+from provider_claude import ClaudeCodeCliAdapter, ClaudeDesktopCoworkProbe
+from provider_codex import CodexAdapter
+from provider_opencode import OpenCodeAdapter
 from file_watcher import register_project, get_global_watcher
 from tools import register_tools, set_current_project_root
 
@@ -178,6 +185,48 @@ class ProjectMiddleware:
 
 _model_loaded = False
 _server_mode_ready = False
+_BACKFILL_STATE = _SERVER_DIR / "backfill_state.json"
+_backfill_manager = BackfillManager(_BACKFILL_STATE)
+
+
+def _provider_health() -> dict:
+    providers = [
+        ClaudeCodeCliAdapter(),
+        ClaudeDesktopCoworkProbe(),
+        CodexAdapter(),
+        OpenCodeAdapter(),
+        AntigravityAdapter(source_kind="cli"),
+        AntigravityAdapter(source_kind="desktop"),
+    ]
+    health = {}
+    for provider in providers:
+        try:
+            status = provider.health()
+            health[status.provider] = asdict(status)
+        except Exception as exc:
+            name = getattr(provider, "provider", provider.__class__.__name__)
+            health[name] = {"provider": name, "status": "error", "error": str(exc)}
+    return health
+
+
+def _backfill_status_payload() -> dict:
+    status = _backfill_manager.status()
+    return {
+        "paused": status.paused,
+        "jobs": [asdict(job) for job in status.jobs],
+        "providers": {
+            provider: asdict(provider_status)
+            for provider, provider_status in status.providers.items()
+        },
+    }
+
+
+def _embedding_status_payload() -> dict:
+    identity = EmbeddingIdentity.current_local()
+    return {
+        "identity": asdict(identity),
+        "budget": get_embedding_budget().status(),
+    }
 
 
 async def health(request: Request) -> JSONResponse:
@@ -191,7 +240,42 @@ async def health(request: Request) -> JSONResponse:
         "milvus": _server_mode_ready,
         "milvus_backend": "standalone" if MILVUS_URI.startswith("http") else "lite",
         "watchers": {k: v for k, v in watchers.items()},
+        "providers": _provider_health(),
+        "backfill": _backfill_status_payload(),
+        "embedding": _embedding_status_payload(),
     })
+
+
+async def backfill_control_endpoint(request: Request) -> JSONResponse:
+    """Local provider-scoped backfill queue/status controls."""
+    if request.method == "GET":
+        return JSONResponse(_backfill_status_payload())
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    action = body.get("action", "status")
+    provider = body.get("provider")
+    if action == "pause":
+        _backfill_manager.pause(provider=provider)
+    elif action == "resume":
+        _backfill_manager.resume(provider=provider)
+    elif action == "enqueue":
+        if not provider:
+            return JSONResponse({"error": "provider is required for enqueue"}, status_code=400)
+        _backfill_manager.enqueue_provider_backfill(
+            provider=provider,
+            mode=body.get("mode", "recent"),
+            limit=body.get("limit"),
+            since=body.get("since", ""),
+            priority=int(body.get("priority", 0)),
+        )
+    elif action != "status":
+        return JSONResponse({"error": f"Unknown backfill action: {action}"}, status_code=400)
+
+    return JSONResponse(_backfill_status_payload())
 
 
 # --- Index endpoint (called by hooks) ---
@@ -469,6 +553,7 @@ session_manager = StreamableHTTPSessionManager(
 app = Starlette(
     routes=[
         Route("/health", health, methods=["GET"]),
+        Route("/backfill", backfill_control_endpoint, methods=["GET", "POST"]),
         Route("/index", index_endpoint, methods=["POST"]),
         Route("/watch", watch_endpoint, methods=["POST"]),
         Mount("/mcp", app=ProjectMiddleware(session_manager.handle_request)),
