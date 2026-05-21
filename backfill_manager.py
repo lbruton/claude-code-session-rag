@@ -164,15 +164,22 @@ class BackfillManager:
             return
         self.global_paused = bool(data.get("global_paused", False))
         self.paused_providers = set(data.get("paused_providers", []))
-        self.jobs = {
-            item["job_id"]: BackfillJob(**item)
-            for item in data.get("jobs", [])
-            if "job_id" in item
-        }
-        self.provider_stats = {
-            provider: ProviderBackfillStatus(**status)
-            for provider, status in data.get("providers", {}).items()
-        }
+        self.jobs = {}
+        for item in data.get("jobs", []):
+            if not isinstance(item, dict) or "job_id" not in item:
+                continue
+            try:
+                self.jobs[item["job_id"]] = BackfillJob(**item)
+            except TypeError:
+                continue
+        self.provider_stats = {}
+        for provider, status in data.get("providers", {}).items():
+            if not isinstance(status, dict):
+                continue
+            try:
+                self.provider_stats[provider] = ProviderBackfillStatus(**status)
+            except TypeError:
+                continue
 
     def save_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)

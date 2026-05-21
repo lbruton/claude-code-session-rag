@@ -158,9 +158,56 @@ def cmd_status(args):
 
 
 def cmd_backfill(args):
-    """Print the intended provider backfill control action."""
-    provider = getattr(args, "provider", None) or "all"
-    print(f"Backfill {args.action}: provider={provider}")
+    """Control the provider-aware backfill queue."""
+    from backfill_manager import BackfillManager
+
+    state_path = Path.home() / ".sessionflow" / "backfill_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    manager = BackfillManager(state_path)
+
+    provider_arg = getattr(args, "provider", None)
+    provider_label = provider_arg or "all"
+    provider_kw = None if not provider_arg else provider_arg
+    action = args.action
+
+    try:
+        if action == "status":
+            status = manager.status()
+            print(f"Backfill status (provider={provider_label}):")
+            print(f"  Global paused: {status.paused}")
+            print(f"  Queued jobs:   {len(status.jobs)}")
+            for job in status.jobs:
+                if provider_kw and job.provider != provider_kw:
+                    continue
+                print(f"    [{job.provider}] {job.mode} job={job.job_id} priority={job.priority}")
+            for provider, pstatus in sorted(status.providers.items()):
+                if provider_kw and provider != provider_kw:
+                    continue
+                print(
+                    f"  Provider {provider}: queued={pstatus.queued_jobs} "
+                    f"paused={pstatus.paused} processed_sources={pstatus.processed_sources} "
+                    f"indexed_turns={pstatus.indexed_turns} errors={pstatus.error_count}"
+                )
+        elif action == "pause":
+            manager.pause(provider=provider_kw)
+            print(f"Backfill paused: provider={provider_label}")
+        elif action == "resume":
+            manager.resume(provider=provider_kw)
+            print(f"Backfill resumed: provider={provider_label}")
+        elif action == "enqueue":
+            if not provider_kw:
+                print("Backfill enqueue requires --provider <name>", file=sys.stderr)
+                return 2
+            mode = getattr(args, "mode", None) or "recent"
+            job = manager.enqueue_provider_backfill(provider=provider_kw, mode=mode)
+            print(f"Backfill enqueued: provider={provider_kw} mode={mode} job_id={job.job_id}")
+        else:
+            print(f"Unknown backfill action: {action}", file=sys.stderr)
+            return 2
+    except Exception as exc:
+        print(f"Backfill {action} failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def build_parser():

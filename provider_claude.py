@@ -56,11 +56,19 @@ class ClaudeCodeCliAdapter:
         cursor: Optional[Dict],
     ) -> ProviderParseResult:
         start_offset = int((cursor or {}).get("last_byte_offset", 0))
-        turns, new_offset = transcript_parser.parse_transcript(
-            source.path,
-            source.logical_session_id,
-            start_offset=start_offset,
-        )
+        try:
+            turns, new_offset = transcript_parser.parse_transcript(
+                source.path,
+                source.logical_session_id,
+                start_offset=start_offset,
+            )
+        except OSError as exc:
+            return ProviderParseResult(
+                source=source,
+                turns=[],
+                cursor=cursor or {},
+                errors=[str(exc)],
+            )
         normalized = []
         for turn in turns:
             text = turn.get("text", turn.get("content", ""))

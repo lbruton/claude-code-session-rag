@@ -265,12 +265,16 @@ async def backfill_control_endpoint(request: Request) -> JSONResponse:
     elif action == "enqueue":
         if not provider:
             return JSONResponse({"error": "provider is required for enqueue"}, status_code=400)
+        try:
+            priority = int(body.get("priority", 0))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "priority must be an integer"}, status_code=400)
         _backfill_manager.enqueue_provider_backfill(
             provider=provider,
             mode=body.get("mode", "recent"),
             limit=body.get("limit"),
             since=body.get("since", ""),
-            priority=int(body.get("priority", 0)),
+            priority=priority,
         )
     elif action != "status":
         return JSONResponse({"error": f"Unknown backfill action: {action}"}, status_code=400)
