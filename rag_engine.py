@@ -36,7 +36,11 @@ import time
 
 from fts_hybrid import FTSIndex, rrf_merge
 from embedding_control import EmbeddingIdentity, get_embedding_budget
-from provider_adapters import default_provider_metadata
+from provider_adapters import (
+    LEGAL_PROVIDERS,
+    LEGAL_SOURCE_KINDS,
+    default_provider_metadata,
+)
 
 logger = logging.getLogger("sessionflow.milvus")
 
@@ -508,6 +512,20 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
     date_from/date_to: ISO 8601 date strings (e.g. '2026-04-02') to restrict
     results to a time range. Timestamps are VARCHAR and sort lexicographically.
     """
+    # Validate provider/source_kind before they reach Milvus filter strings.
+    # These flow through to a server-side expression as raw quoted values;
+    # rejecting unknown inputs early prevents filter-expression injection.
+    if provider is not None and provider not in LEGAL_PROVIDERS:
+        allowed = ", ".join(sorted(LEGAL_PROVIDERS))
+        raise ValueError(
+            f"Invalid provider: {provider!r}; expected one of: {allowed}"
+        )
+    if source_kind is not None and source_kind not in LEGAL_SOURCE_KINDS:
+        allowed = ", ".join(sorted(LEGAL_SOURCE_KINDS))
+        raise ValueError(
+            f"Invalid source_kind: {source_kind!r}; expected one of: {allowed}"
+        )
+
     # Expanded candidate pool for both engines
     fetch_n = n * 3
 
@@ -613,6 +631,18 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
 
     if recency_boost and merged:
         merged = _apply_recency_boost(merged, n)
+
+    # If the FTS table was recently dropped + recreated and backfill hasn't
+    # caught up, surface a one-line warning on each row's metadata so callers
+    # can render it without us blocking the search.
+    try:
+        from fts_hybrid import fts_backfill_required
+        if fts_backfill_required():
+            notice = "keyword index rebuilding, results may be vector-only"
+            for r in merged[:n]:
+                r["_fts_warning"] = notice
+    except Exception:  # pragma: no cover - sentinel check is best-effort
+        pass
 
     return merged[:n]
 
@@ -990,6 +1020,12 @@ def backfill_fts(db_path: Optional[str] = None) -> int:
                     hydrate_and_insert(missing_doc_ids)
 
         logger.info("FTS backfill: inserted %d records", inserted)
+        # Sentinel-driven warning is no longer relevant once we've repopulated.
+        try:
+            from fts_hybrid import clear_fts_backfill_sentinel
+            clear_fts_backfill_sentinel()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to clear FTS sentinel: %s", exc)
         return inserted
     finally:
         _fts.close_ephemeral(fts_conn)

@@ -29,6 +29,48 @@ class OpenCodeAdapter:
             else Path.home() / ".local" / "share" / "opencode" / "storage"
         )
         self.settled_seconds = settled_seconds
+        # Per-pass caches populated by _refresh_indexes(). One walk of
+        # message/ and part/ replaces the O(N*M) per-session rescans.
+        self._messages_by_session: Dict[str, List[tuple[Path, Dict]]] = {}
+        self._parts_by_session: Dict[str, List[tuple[Path, Dict]]] = {}
+        self._all_message_ids: set[str] = set()
+        self._all_parts: List[tuple[Path, Dict]] = []
+        self._indexes_built = False
+
+    def _refresh_indexes(self) -> None:
+        """Walk message/ and part/ once and bucket records by sessionID."""
+        self._messages_by_session = {}
+        self._parts_by_session = {}
+        self._all_message_ids = set()
+        self._all_parts = []
+
+        message_root = self.storage_root / "message"
+        if message_root.exists():
+            for path in sorted(message_root.glob("*.json")):
+                data = self._load_json(path)
+                session_id = data.get("sessionID") or data.get("session_id")
+                if session_id:
+                    self._messages_by_session.setdefault(str(session_id), []).append((path, data))
+                msg_id = data.get("id")
+                if msg_id:
+                    self._all_message_ids.add(str(msg_id))
+
+        part_root = self.storage_root / "part"
+        if part_root.exists():
+            for path in sorted(part_root.glob("*.json")):
+                data = self._load_json(path)
+                self._all_parts.append((path, data))
+                session_id = data.get("sessionID") or data.get("session_id")
+                if session_id:
+                    self._parts_by_session.setdefault(str(session_id), []).append((path, data))
+        self._indexes_built = True
+
+    def _clear_indexes(self) -> None:
+        self._messages_by_session = {}
+        self._parts_by_session = {}
+        self._all_message_ids = set()
+        self._all_parts = []
+        self._indexes_built = False
 
     def _load_json(self, path: Path) -> Dict:
         try:
@@ -41,6 +83,9 @@ class OpenCodeAdapter:
         return sorted(root.glob("*.json")) if root.exists() else []
 
     def discover_sources(self) -> List[ProviderSource]:
+        # Build per-pass indexes once; reused by every parse_source() call
+        # against the same adapter instance until the next discover_sources().
+        self._refresh_indexes()
         sources = []
         for path in self._session_files():
             data = self._load_json(path)
@@ -63,26 +108,14 @@ class OpenCodeAdapter:
         return sources
 
     def _message_records(self, session_id: str) -> List[tuple[Path, Dict]]:
-        root = self.storage_root / "message"
-        records = []
-        if not root.exists():
-            return records
-        for path in sorted(root.glob("*.json")):
-            data = self._load_json(path)
-            if data.get("sessionID") == session_id or data.get("session_id") == session_id:
-                records.append((path, data))
-        return records
+        if not self._indexes_built:
+            self._refresh_indexes()
+        return list(self._messages_by_session.get(session_id, []))
 
     def _part_records(self, session_id: str) -> List[tuple[Path, Dict]]:
-        root = self.storage_root / "part"
-        records = []
-        if not root.exists():
-            return records
-        for path in sorted(root.glob("*.json")):
-            data = self._load_json(path)
-            if data.get("sessionID") == session_id or data.get("session_id") == session_id:
-                records.append((path, data))
-        return records
+        if not self._indexes_built:
+            self._refresh_indexes()
+        return list(self._parts_by_session.get(session_id, []))
 
     def _is_settled(self, paths: List[Path]) -> bool:
         if self.settled_seconds <= 0:
@@ -164,17 +197,12 @@ class OpenCodeAdapter:
         )
 
     def _orphan_part_count(self) -> int:
-        message_ids = {
-            self._load_json(path).get("id")
-            for path in (self.storage_root / "message").glob("*.json")
-        } if (self.storage_root / "message").exists() else set()
+        if not self._indexes_built:
+            self._refresh_indexes()
         count = 0
-        part_root = self.storage_root / "part"
-        if not part_root.exists():
-            return 0
-        for path in part_root.glob("*.json"):
-            data = self._load_json(path)
-            if (data.get("messageID") or data.get("message_id")) not in message_ids:
+        for _, data in self._all_parts:
+            message_id = data.get("messageID") or data.get("message_id")
+            if message_id and str(message_id) not in self._all_message_ids:
                 count += 1
         return count
 

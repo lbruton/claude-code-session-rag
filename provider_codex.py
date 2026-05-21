@@ -99,7 +99,14 @@ class CodexAdapter:
         source: ProviderSource,
         cursor: Optional[Dict],
     ) -> ProviderParseResult:
-        known_paths = self._known_paths.get(source.source_id, [source.path])
+        # _known_paths is populated by discover_sources() and may be stale
+        # or empty when callers reuse a shared adapter instance across
+        # threads. Fall back to the source's own path/canonical_path rather
+        # than dropping the session silently.
+        known_paths = self._known_paths.get(source.source_id)
+        if not known_paths:
+            fallback = source.path or source.canonical_path
+            known_paths = [fallback] if fallback else []
         emitted: set[str] = set((cursor or {}).get("emitted_ids", []))
         turns = []
         for path in known_paths:

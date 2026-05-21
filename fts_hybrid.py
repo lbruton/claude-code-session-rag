@@ -26,6 +26,24 @@ from typing import Dict, List, Optional, Set
 
 logger = logging.getLogger("fts-hybrid")
 
+# Sentinel written when the FTS table is dropped and recreated — signals that
+# keyword search will degrade to vector-only until backfill_fts() repopulates.
+# Consumed by rag_engine.search() to surface a one-line notice in result meta.
+FTS_BACKFILL_SENTINEL = Path.home() / ".sessionflow" / "fts_backfill_required"
+
+
+def fts_backfill_required() -> bool:
+    return FTS_BACKFILL_SENTINEL.exists()
+
+
+def clear_fts_backfill_sentinel() -> None:
+    try:
+        FTS_BACKFILL_SENTINEL.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Failed to clear FTS backfill sentinel: %s", exc)
+
 
 class FTSIndex:
     """SQLite FTS5 full-text search index, designed as a sidecar to Milvus.
@@ -114,8 +132,18 @@ class FTSIndex:
             return
 
         if row:
-            # Schema changed — drop and recreate
-            logger.info("FTS schema changed for %s, rebuilding...", self.table_name)
+            # Schema changed — drop and recreate. Keyword search will degrade
+            # to vector-only until backfill_fts() repopulates this table.
+            logger.warning(
+                "FTS schema changed for %s, dropping and rebuilding — keyword "
+                "search will degrade to vector-only until FTS backfill completes",
+                self.table_name,
+            )
+            try:
+                FTS_BACKFILL_SENTINEL.parent.mkdir(parents=True, exist_ok=True)
+                FTS_BACKFILL_SENTINEL.touch()
+            except OSError as exc:
+                logger.warning("Failed to write FTS backfill sentinel: %s", exc)
             conn.execute(f"DROP TABLE IF EXISTS {self.table_name}")
 
         conn.execute(self._create_sql)

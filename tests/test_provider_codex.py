@@ -25,6 +25,24 @@ def test_codex_adapter_dedups_active_and_archived_paths_by_logical_session(synth
     }
 
 
+def test_codex_parse_falls_back_when_known_paths_cache_is_stale(synthetic_codex_home):
+    """Sharing one CodexAdapter instance across discover/parse pairs (and
+    between threads) means _known_paths can be wiped by a concurrent
+    discover_sources(). parse_source() must not crash or silently drop the
+    session — fall back to the source's own path."""
+    from provider_codex import CodexAdapter
+
+    adapter = CodexAdapter(home=synthetic_codex_home)
+    source = next(s for s in adapter.discover_sources() if s.logical_session_id == "synthetic-session")
+
+    # Simulate a second discover pass clearing the cache mid-flight.
+    adapter._known_paths = {}
+
+    parsed = adapter.parse_source(source, cursor=None)
+    assert parsed.turns, "fallback should still parse the source file"
+    assert parsed.cursor["known_paths"], "cursor still records at least the fallback path"
+
+
 def test_codex_adapter_marks_unknown_project_scope_when_cwd_missing(tmp_path):
     from provider_codex import CodexAdapter
 

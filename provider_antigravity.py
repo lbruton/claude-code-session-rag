@@ -94,6 +94,10 @@ class AntigravityAdapter:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # TODO(SESF-6+): step_index can collide across logical sessions if
+            # cursor provenance is shared (e.g. resumed conversation with a
+            # rewritten transcript). Revisit cursor scoping once we have
+            # ground-truth examples of multi-session step_index reuse.
             step_index = int(entry.get("step_index") or entry.get("stepIndex") or line_number)
             if step_index <= last_step:
                 continue

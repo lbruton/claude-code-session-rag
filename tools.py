@@ -10,6 +10,7 @@ from mcp.server import Server
 from mcp import types
 
 import rag_engine
+from provider_adapters import LEGAL_PROVIDERS, LEGAL_SOURCE_KINDS
 
 
 # --- Project context ---
@@ -313,6 +314,21 @@ def register_tools(server: Server):
                     pr = pr_arg  # explicit project
                 else:
                     pr = current_project  # default: current project
+
+                provider_arg = arguments.get("provider")
+                source_kind_arg = arguments.get("source_kind")
+                if provider_arg is not None and provider_arg not in LEGAL_PROVIDERS:
+                    allowed = ", ".join(sorted(LEGAL_PROVIDERS))
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Invalid provider: {provider_arg!r}; expected one of: {allowed}",
+                    )]
+                if source_kind_arg is not None and source_kind_arg not in LEGAL_SOURCE_KINDS:
+                    allowed = ", ".join(sorted(LEGAL_SOURCE_KINDS))
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Invalid source_kind: {source_kind_arg!r}; expected one of: {allowed}",
+                    )]
 
                 results = rag_engine.search(
                     arguments["query"],

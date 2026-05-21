@@ -50,6 +50,15 @@ LEGAL_CURSOR_TYPES = frozenset({
     "step_index",
 })
 
+LEGAL_HEALTH_STATUSES = frozenset({
+    "ok",
+    "missing",
+    "warning",
+    "partial",
+    "probe-only",
+    "error",
+})
+
 
 def _validate_choice(field_name: str, value: str, legal_values: frozenset[str]) -> None:
     if value not in legal_values:
@@ -156,6 +165,7 @@ class ProviderHealth:
 
     def __post_init__(self) -> None:
         _validate_choice("provider", self.provider, LEGAL_PROVIDERS)
+        _validate_choice("status", self.status, LEGAL_HEALTH_STATUSES)
 
 
 @dataclass
