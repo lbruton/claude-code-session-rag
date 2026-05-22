@@ -310,6 +310,45 @@ async def backfill_control_endpoint(request: Request) -> JSONResponse:
             since=body.get("since", ""),
             priority=priority,
         )
+    elif action == "run":
+        # Hourly LaunchAgent entrypoint: enqueue every enabled provider in the
+        # requested mode and drain the queue inline using the server's already
+        # warmed-up MLX executor. Avoids the multi-process Metal risk of
+        # spinning up a parallel MLX context from cleanup.py.
+        from provider_adapters import LEGAL_PROVIDERS
+        from provider_ingestion import ProviderIngestionService
+
+        mode = body.get("mode", "incremental")
+        _VALID_MODES = {"recent", "incremental", "full"}
+        if mode not in _VALID_MODES:
+            return JSONResponse(
+                {"detail": f"Invalid mode {mode!r}. Must be one of: {sorted(_VALID_MODES)}"},
+                status_code=400,
+            )
+        providers_arg = body.get("providers")
+        if isinstance(providers_arg, str):
+            providers = [p.strip() for p in providers_arg.split(",") if p.strip()]
+        elif isinstance(providers_arg, list):
+            providers = [str(p).strip() for p in providers_arg if str(p).strip()]
+        else:
+            providers = sorted(LEGAL_PROVIDERS - {"claude_desktop_cowork"})
+        skipped: list[str] = []
+        for provider in providers:
+            try:
+                _backfill_manager.enqueue_provider_backfill(provider=provider, mode=mode)
+            except ValueError:
+                skipped.append(provider)
+        totals = await ProviderIngestionService(
+            _backfill_manager, MILVUS_URI
+        ).process_queued_jobs()
+        payload = _backfill_status_payload()
+        payload["run"] = {
+            "mode": mode,
+            "providers": [p for p in providers if p not in skipped],
+            "skipped": skipped,
+            "totals": totals,
+        }
+        return JSONResponse(payload)
     elif action != "status":
         return JSONResponse({"error": f"Unknown backfill action: {action}"}, status_code=400)
 

@@ -226,6 +226,40 @@ def cmd_backfill(args) -> int:
             mode = getattr(args, "mode", None) or "recent"
             job = manager.enqueue_provider_backfill(provider=provider_kw, mode=mode)
             print(f"Backfill enqueued: provider={provider_kw} mode={mode} job_id={job.job_id}")
+        elif action == "run":
+            mode = getattr(args, "mode", None) or "incremental"
+            providers_arg = getattr(args, "providers", None)
+            if providers_arg:
+                providers = [p.strip() for p in providers_arg.split(",") if p.strip()]
+            else:
+                from provider_adapters import LEGAL_PROVIDERS
+                providers = sorted(LEGAL_PROVIDERS - {"claude_desktop_cowork"})
+            from provider_ingestion import ProviderIngestionService
+            import asyncio
+
+            db = get_db_path()
+            for provider in providers:
+                try:
+                    manager.enqueue_provider_backfill(provider=provider, mode=mode)
+                except ValueError as exc:
+                    print(f"Skipping {provider}: {exc}", file=sys.stderr)
+            # SESF-8: add_turns_async requires the dedicated MLX executor.
+            # Init for the duration of the drain, then tear down so we don't
+            # leave Metal contexts hanging in a short-lived CLI process.
+            rag_engine.init_server_mode(db_path=db)
+            try:
+                totals = asyncio.run(
+                    ProviderIngestionService(manager, db).process_queued_jobs()
+                )
+            finally:
+                rag_engine.close_server_mode()
+            print(
+                f"Backfill run complete (mode={mode}): "
+                f"jobs={totals.get('jobs', 0)} "
+                f"processed_sources={totals.get('processed_sources', 0)} "
+                f"indexed_turns={totals.get('indexed_turns', 0)} "
+                f"errors={totals.get('errors', 0)}"
+            )
         else:
             print(f"Unknown backfill action: {action}", file=sys.stderr)
             return 2
@@ -285,6 +319,19 @@ def build_parser():
     p_enqueue = backfill_sub.add_parser("enqueue", help="Enqueue provider backfill")
     p_enqueue.add_argument("--provider", required=True, help="Provider to enqueue")
     p_enqueue.add_argument("--mode", default="recent", choices=("recent", "incremental", "full"))
+    p_run = backfill_sub.add_parser(
+        "run",
+        help=(
+            "Enqueue + drain backfill for one or more providers (defaults to all). "
+            "Designed for the hourly LaunchAgent: pairs enqueue with an immediate "
+            "synchronous drain so jobs don't sit waiting for the next server restart."
+        ),
+    )
+    p_run.add_argument("--mode", default="incremental", choices=("recent", "incremental", "full"))
+    p_run.add_argument(
+        "--providers",
+        help="Comma-separated provider list (default: all enabled providers).",
+    )
 
     return parser
 

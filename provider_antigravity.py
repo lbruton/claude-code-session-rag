@@ -120,6 +120,15 @@ class AntigravityAdapter:
             text = entry.get("text") or entry.get("content") or entry.get("message") or ""
             if not text:
                 continue
+            # Antigravity transcripts use `created_at`; older / desktop variants
+            # have also been seen with `timestamp`. Accept either.
+            raw_ts = next(
+                (
+                    v for k in ("timestamp", "created_at", "createdAt", "time")
+                    if (v := entry.get(k)) is not None and v != ""
+                ),
+                None,
+            )
             doc_hash = hashlib.sha256(
                 f"{source.logical_session_id}:{step_index}:{text}".encode("utf-8")
             ).hexdigest()[:16]
@@ -140,7 +149,7 @@ class AntigravityAdapter:
                 "source_path": source.path,
                 "transcript_file": Path(source.path).name,
                 "turn_index": step_index,
-                "timestamp": normalize_timestamp(entry.get("timestamp")) or source.timestamp,
+                "timestamp": normalize_timestamp(raw_ts) or source.timestamp,
                 "git_branch": "",
                 "chunk_type": entry.get("type", "turn"),
                 "project_root": source.project_root,
