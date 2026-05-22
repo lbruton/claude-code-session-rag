@@ -130,13 +130,14 @@ import sys
 settings_file = "$SETTINGS_FILE"
 script_dir = "$SCRIPT_DIR"
 venv_python = "$VENV_PYTHON"
+launcher = os.path.expanduser("~/.sessionflow/sessionflow-launcher.sh")
 
 # Our hooks to install
 our_hooks = {
     "SessionStart": [
         {
             "type": "command",
-            "command": f"{script_dir}/sessionflow-server.sh start",
+            "command": f"{launcher} start",
             "timeout": 30000,
         },
         {
@@ -262,7 +263,7 @@ PYEOF
 # --- Optional LaunchAgent (autostart at login) ---
 # Off by default. Enable non-interactively with SESSIONFLOW_INSTALL_AGENT=1, or
 # answer "y" when prompted in an interactive shell. The LaunchAgent runs
-# ./sessionflow-server.sh start at login, before any harness hooks fire — this
+# ~/.sessionflow/sessionflow-launcher.sh run at login, before any harness hooks fire — this
 # avoids multiple terminals racing on server start when several harnesses
 # (Claude Code, Codex, OpenCode, Antigravity CLI) launch at once.
 echo ""

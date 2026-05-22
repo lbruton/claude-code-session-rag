@@ -68,6 +68,7 @@ search_session("the milvus migration", session_id="<CLAUDE_SESSION_ID>")
 ./sessionflow-server.sh stop      # Stop server
 ./sessionflow-server.sh restart   # Restart
 ./sessionflow-server.sh status    # Check health
+~/.sessionflow/sessionflow-launcher.sh start # Hook-safe start via LaunchAgent
 
 curl http://127.0.0.1:7102/health # Health check
 ```
