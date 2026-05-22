@@ -7,6 +7,7 @@ turn dictionaries that the existing storage/search layers can index.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 import hashlib
@@ -76,6 +77,31 @@ def build_source_id(provider: str, logical_session_id: str, canonical_path: str)
     _validate_choice("provider", provider, LEGAL_PROVIDERS)
     digest = hashlib.sha256(canonical_path.encode("utf-8")).hexdigest()[:16]
     return f"{provider}:{logical_session_id}:{digest}"
+
+
+def normalize_timestamp(value: Any) -> str:
+    """Coerce a provider-emitted timestamp to a Milvus-compatible VARCHAR(64) string.
+
+    Accepts ISO 8601 strings (returned unchanged after str()), numeric Unix epochs
+    in seconds or milliseconds (auto-detected by magnitude), datetime instances,
+    or None/empty. Used by every provider before turn emission so the Milvus
+    schema's VARCHAR(64) `timestamp` field never receives an int.
+    """
+    if value is None or value == "":
+        return ""
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        # Heuristic: anything > 1e12 is milliseconds (≈ year 33658 in seconds).
+        seconds = float(value) / 1000.0 if abs(value) > 1e12 else float(value)
+        try:
+            return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return ""
+    return str(value)
 
 
 def default_provider_metadata() -> Dict[str, str]:

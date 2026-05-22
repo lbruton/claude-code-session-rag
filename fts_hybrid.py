@@ -21,6 +21,7 @@ Usage:
 
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -60,7 +61,11 @@ class FTSIndex:
         self.table_name = table_name
         self.metadata_columns = metadata_columns
         self._indexed_metadata = indexed_metadata or set()
-        self._connections: Dict[str, sqlite3.Connection] = {}
+        # SESF-13: sqlite3 connections are bound to the thread that opened them.
+        # Server-mode persistent caching MUST be per-thread; otherwise the
+        # request thread crashes trying to close a connection created by the
+        # MLX embed executor (or vice versa) and we leak the file handle.
+        self._tls = threading.local()
         self._server_mode = False
 
         # Pre-compute SQL fragments
@@ -89,15 +94,39 @@ class FTSIndex:
     def set_server_mode(self, enabled: bool):
         self._server_mode = enabled
 
+    def _connections(self) -> Dict[str, sqlite3.Connection]:
+        """Per-thread connection cache (server mode only).
+
+        Returns the calling thread's connection dict, creating it on first use.
+        """
+        store = getattr(self._tls, "connections", None)
+        if store is None:
+            store = {}
+            self._tls.connections = store
+        return store
+
     def close_all(self):
-        """Close all persistent connections."""
-        for path, conn in list(self._connections.items()):
+        """Close persistent connections owned by THIS THREAD.
+
+        sqlite3 enforces that a connection is only safe to close on the thread
+        that opened it. Connections opened by other threads (MLX embed executor,
+        watcher worker, etc.) must close themselves when those threads exit.
+        """
+        store = getattr(self._tls, "connections", None)
+        if not store:
+            return
+        for path, conn in list(store.items()):
             try:
                 conn.close()
                 logger.info("Closed FTS connection: %s", path)
+            except sqlite3.ProgrammingError as e:
+                # Thread-affinity violation — leave the connection alone and
+                # let its owning thread clean it up. Logged at debug to avoid
+                # noise; the only real cost is a delayed file-handle release.
+                logger.debug("Skipping cross-thread FTS close for %s: %s", path, e)
             except Exception as e:
                 logger.warning("Error closing FTS connection %s: %s", path, e)
-        self._connections.clear()
+        store.clear()
 
     @staticmethod
     def db_path(milvus_db_path: str) -> str:
@@ -154,29 +183,30 @@ class FTSIndex:
         conn.commit()
 
     def connection(self, milvus_db_path: str) -> sqlite3.Connection:
-        """Get or create a connection. Persistent in server mode, ephemeral otherwise."""
+        """Get or create a connection. Persistent (per-thread) in server mode."""
         fts_path = self.db_path(milvus_db_path)
+        store = self._connections() if self._server_mode else None
 
-        if fts_path in self._connections:
+        if store is not None and fts_path in store:
             try:
-                self._connections[fts_path].execute("SELECT 1")
-                return self._connections[fts_path]
+                store[fts_path].execute("SELECT 1")
+                return store[fts_path]
             except Exception:
                 logger.warning("Stale FTS connection for %s — reconnecting", fts_path)
                 try:
-                    self._connections[fts_path].close()
+                    store[fts_path].close()
                 except Exception:
                     pass
-                del self._connections[fts_path]
+                del store[fts_path]
 
         Path(fts_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(fts_path)
         conn.execute("PRAGMA journal_mode=WAL")
         self._check_and_migrate(conn)
 
-        if self._server_mode:
-            self._connections[fts_path] = conn
-            logger.info("Opened FTS connection: %s", fts_path)
+        if store is not None:
+            store[fts_path] = conn
+            logger.info("Opened FTS connection: %s (thread=%s)", fts_path, threading.get_ident())
 
         return conn
 
@@ -292,14 +322,17 @@ class FTSIndex:
         return results
 
     def clear(self, db_path: str):
-        """Delete the FTS database file. Closes persistent connection first."""
+        """Delete the FTS database file. Closes the current-thread connection first."""
         fts_path = self.db_path(db_path)
-        if fts_path in self._connections:
+        store = getattr(self._tls, "connections", None) or {}
+        if fts_path in store:
             try:
-                self._connections[fts_path].close()
+                store[fts_path].close()
+            except sqlite3.ProgrammingError:
+                pass
             except Exception:
                 pass
-            del self._connections[fts_path]
+            del store[fts_path]
         fts_file = Path(fts_path)
         if fts_file.exists():
             fts_file.unlink()

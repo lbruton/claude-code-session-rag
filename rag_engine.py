@@ -323,14 +323,13 @@ def _resolve_db_path(db_path: Optional[str]) -> str:
     return db_path
 
 
-def _ensure_collection(client: MilvusClient, db_path: str = ""):
-    """Create the sessions collection with explicit schema if it doesn't exist."""
-    if client.has_collection(COLLECTION_NAME):
-        return
+def _expected_schema_fields() -> List[FieldSchema]:
+    """Source-of-truth Milvus field list for the sessions collection.
 
-    print(f"Creating collection: {COLLECTION_NAME} (dim={_EMBED_DIM})", file=sys.stderr)
-
-    schema = CollectionSchema(fields=[
+    Used by both _ensure_collection() (create path) and _detect_schema_drift()
+    (startup validation) so the two can't drift out of sync.
+    """
+    return [
         FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
         FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=_EMBED_DIM),
         FieldSchema(name="document", dtype=DataType.VARCHAR, max_length=65535),
@@ -348,7 +347,96 @@ def _ensure_collection(client: MilvusClient, db_path: str = ""):
         FieldSchema(name="git_branch", dtype=DataType.VARCHAR, max_length=256),
         FieldSchema(name="chunk_type", dtype=DataType.VARCHAR, max_length=64),
         FieldSchema(name="project_root", dtype=DataType.VARCHAR, max_length=512),
-    ])
+    ]
+
+
+def detect_schema_drift(client: MilvusClient) -> List[str]:
+    """Return a list of missing or extra field names if the live collection
+    schema differs from `_expected_schema_fields()`. Empty list = no drift.
+
+    Only field NAMES are diffed today — pymilvus's describe_collection output
+    shape varies across Milvus Lite vs Standalone, and we have not hit a
+    case where a same-named field changed dtype/length silently.
+    """
+    if not client.has_collection(COLLECTION_NAME):
+        return []
+    try:
+        info = client.describe_collection(COLLECTION_NAME)
+    except Exception as exc:
+        print(f"Schema drift check skipped: describe_collection failed: {exc}", file=sys.stderr)
+        return []
+    expected = {f.name for f in _expected_schema_fields()}
+    actual: set[str] = set()
+    for field in info.get("fields", []) or []:
+        if isinstance(field, dict):
+            name = field.get("name")
+        else:
+            name = getattr(field, "name", None)
+        if name:
+            actual.add(name)
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    return [f"missing:{n}" for n in missing] + [f"extra:{n}" for n in extra]
+
+
+def migrate_schema(client: MilvusClient, db_path: str = "") -> None:
+    """Drop the sessions collection and recreate it with the current schema.
+
+    DESTRUCTIVE: all indexed turns are lost. Provided as the explicit recovery
+    path for `python cleanup.py migrate-schema` and for the auto-migrate
+    env opt-in (SESSIONFLOW_AUTO_MIGRATE_SCHEMA=1).
+    """
+    if client.has_collection(COLLECTION_NAME):
+        print(
+            f"Dropping collection {COLLECTION_NAME!r} for schema migration "
+            "(all indexed turns will be lost)",
+            file=sys.stderr,
+        )
+        client.drop_collection(COLLECTION_NAME)
+    _create_collection(client, db_path)
+
+
+def _ensure_collection(client: MilvusClient, db_path: str = "") -> None:
+    """Create the sessions collection if missing; refuse to start on schema drift.
+
+    SESF-11: previously this was create-if-missing only, so adding a field to
+    `_expected_schema_fields()` silently broke every insert with
+    DataNotMatchException against the pre-existing Milvus collection. Now:
+      - missing collection → create
+      - present + no drift → no-op
+      - present + drift → if SESSIONFLOW_AUTO_MIGRATE_SCHEMA=1 drop+recreate,
+        else raise RuntimeError telling the operator to run
+        `python cleanup.py migrate-schema`.
+    """
+    if not client.has_collection(COLLECTION_NAME):
+        _create_collection(client, db_path)
+        return
+
+    drift = detect_schema_drift(client)
+    if not drift:
+        return
+
+    auto = os.getenv("SESSIONFLOW_AUTO_MIGRATE_SCHEMA", "").lower() in {"1", "true", "yes", "on"}
+    if auto:
+        print(
+            f"SESSIONFLOW_AUTO_MIGRATE_SCHEMA detected schema drift {drift!r}; "
+            "dropping and recreating (all turns lost).",
+            file=sys.stderr,
+        )
+        migrate_schema(client, db_path)
+        return
+
+    raise RuntimeError(
+        f"Milvus collection {COLLECTION_NAME!r} schema is out of date "
+        f"(drift={drift}). Run `python cleanup.py migrate-schema` to drop "
+        f"and recreate it (destructive), or set "
+        f"SESSIONFLOW_AUTO_MIGRATE_SCHEMA=1 to migrate on startup."
+    )
+
+
+def _create_collection(client: MilvusClient, db_path: str = "") -> None:
+    print(f"Creating collection: {COLLECTION_NAME} (dim={_EMBED_DIM})", file=sys.stderr)
+    schema = CollectionSchema(fields=_expected_schema_fields())
 
     index_params = client.prepare_index_params()
     if _is_remote_uri(db_path):
@@ -376,6 +464,24 @@ def _ensure_collection(client: MilvusClient, db_path: str = ""):
     if _is_remote_uri(db_path):
         client.load_collection(collection_name=COLLECTION_NAME)
         print(f"Collection loaded: {COLLECTION_NAME}", file=sys.stderr)
+
+
+@contextmanager
+def milvus_client_for_migration(db_path: Optional[str] = None):
+    """Open a Milvus client WITHOUT _ensure_collection.
+
+    SESF-11: needed because _ensure_collection refuses to start on schema
+    drift — but the whole point of `cleanup.py migrate-schema` is to repair
+    that drift. This bypass MUST NOT be used outside migration code paths.
+    """
+    path = _resolve_db_path(db_path)
+    if not _is_remote_uri(path):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    client = MilvusClient(path)
+    try:
+        yield client
+    finally:
+        client.close()
 
 
 @contextmanager

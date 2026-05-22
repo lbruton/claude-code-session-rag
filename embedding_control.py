@@ -4,9 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import logging
 import os
 import time
 from typing import Optional
+
+_LOG = logging.getLogger("sessionflow.embedding_budget")
+
+# Default chosen to be effectively non-blocking for a continuous server while
+# still bounding accidental runaway jobs. SESF-12 raised this from 200 (which
+# silently killed inserts after ~minutes of uptime).
+DEFAULT_MAX_TURNS_PER_RUN = 100_000
 
 
 LOCAL_MODEL_DIMS = {
@@ -67,7 +75,7 @@ class EmbeddingIdentity:
 class EmbeddingBudget:
     batch_size: int = 16
     cooldown_ms: int = 200
-    max_turns_per_run: int = 200
+    max_turns_per_run: int = DEFAULT_MAX_TURNS_PER_RUN
     max_files_per_run: int = 100
     recent_days: int = 14
     mode: str = "recent"
@@ -77,6 +85,7 @@ class EmbeddingBudget:
     errors: int = 0
     last_batch_finished_at: float = 0.0
     last_batch_duration: float = 0.0
+    _cap_warned: bool = field(default=False, repr=False)
 
     @classmethod
     def from_env(cls) -> "EmbeddingBudget":
@@ -86,7 +95,11 @@ class EmbeddingBudget:
         return cls(
             batch_size=_env_int("SESSIONFLOW_EMBED_BATCH_SIZE", 16, minimum=1),
             cooldown_ms=_env_int("SESSIONFLOW_EMBED_COOLDOWN_MS", 200, minimum=200),
-            max_turns_per_run=_env_int("SESSIONFLOW_BACKFILL_MAX_TURNS_PER_RUN", 200, minimum=1),
+            max_turns_per_run=_env_int(
+                "SESSIONFLOW_BACKFILL_MAX_TURNS_PER_RUN",
+                DEFAULT_MAX_TURNS_PER_RUN,
+                minimum=1,
+            ),
             max_files_per_run=_env_int("SESSIONFLOW_BACKFILL_MAX_FILES_PER_RUN", 100, minimum=1),
             recent_days=_env_int("SESSIONFLOW_BACKFILL_RECENT_DAYS", 14, minimum=1),
             mode=mode,
@@ -97,6 +110,15 @@ class EmbeddingBudget:
         if self.paused:
             return EmbeddingDecision(False, "Backfill embedding is paused")
         if self.turns_processed + batch_size > self.max_turns_per_run:
+            if not self._cap_warned:
+                _LOG.warning(
+                    "SESSIONFLOW_BACKFILL_MAX_TURNS_PER_RUN=%d reached after "
+                    "%d turns; subsequent batches will be denied until the "
+                    "budget is reset or the cap is raised.",
+                    self.max_turns_per_run,
+                    self.turns_processed,
+                )
+                self._cap_warned = True
             return EmbeddingDecision(False, "Backfill max turns per run reached")
         if batch_size > self.batch_size:
             return EmbeddingDecision(

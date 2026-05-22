@@ -15,6 +15,7 @@ from provider_adapters import (
     ProviderWatchRoot,
     build_source_id,
     canonicalize_path,
+    normalize_timestamp,
 )
 
 
@@ -102,7 +103,7 @@ class OpenCodeAdapter:
                 path=str(path),
                 canonical_path=canonical_path,
                 project_root=data.get("cwd") or data.get("directory") or "unknown",
-                timestamp=created,
+                timestamp=normalize_timestamp(created),
                 status="eligible",
             ))
         return sources
@@ -178,7 +179,7 @@ class OpenCodeAdapter:
                 "source_path": source.path,
                 "transcript_file": Path(source.path).name,
                 "turn_index": index,
-                "timestamp": timestamp or source.timestamp,
+                "timestamp": normalize_timestamp(timestamp) or source.timestamp,
                 "git_branch": "",
                 "chunk_type": role or "turn",
                 "project_root": source.project_root,
