@@ -349,6 +349,7 @@ do_uninstall_agent() {
 
 write_backfill_agent_plist() {
     mkdir -p "$LAUNCH_AGENT_DIR"
+    local port="${SESSIONFLOW_PORT:-7102}"
     cat > "$BACKFILL_AGENT_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyLists-1.0.dtd">
@@ -356,16 +357,25 @@ write_backfill_agent_plist() {
 <dict>
     <key>Label</key>
     <string>${BACKFILL_AGENT_LABEL}</string>
+    <!-- Calls the running server's /backfill endpoint so the drain reuses
+         the server's warmed-up MLX executor. Avoids spawning a parallel
+         MLX/Metal process every hour. If the server is down the curl
+         simply fails (non-fatal) and the next tick retries. -->
     <key>ProgramArguments</key>
     <array>
-        <string>${PYTHON}</string>
-        <string>${SCRIPT_DIR}/cleanup.py</string>
-        <string>backfill</string>
-        <string>enqueue</string>
-        <string>--provider</string>
-        <string>claude_code_cli</string>
-        <string>--mode</string>
-        <string>incremental</string>
+        <string>/usr/bin/curl</string>
+        <string>--silent</string>
+        <string>--show-error</string>
+        <string>--fail</string>
+        <string>--max-time</string>
+        <string>1800</string>
+        <string>-X</string>
+        <string>POST</string>
+        <string>-H</string>
+        <string>Content-Type: application/json</string>
+        <string>-d</string>
+        <string>{"action":"run","mode":"incremental"}</string>
+        <string>http://127.0.0.1:${port}/backfill</string>
     </array>
     <key>StartInterval</key>
     <integer>${BACKFILL_INTERVAL_SECONDS}</integer>
