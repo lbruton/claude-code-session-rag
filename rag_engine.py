@@ -43,6 +43,19 @@ from provider_adapters import (
 logger = logging.getLogger("sessionflow.milvus")
 
 
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    """Truncate `text` so its UTF-8 encoding fits in `max_bytes`.
+
+    Milvus VARCHAR caps are measured in bytes, not Python characters; a naive
+    `text[:max_bytes]` slice happily produces a 65k-character string that
+    serializes to >65k bytes once any multibyte codepoint is present.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
 def _is_remote_uri(uri: str) -> bool:
     """True when uri points to a remote Milvus Standalone (http:// or https://)."""
     return uri.startswith("http://") or uri.startswith("https://")
@@ -581,7 +594,7 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
         data.append({
             "id": int_id,
             "vector": emb,
-            "document": turn["text"][:65535],
+            "document": _truncate_utf8(turn["text"], 65535),
             "doc_id": turn["doc_id"],
             "session_id": turn.get("session_id", ""),
             "logical_session_id": turn.get("logical_session_id", turn.get("session_id", "")),
