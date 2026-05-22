@@ -32,6 +32,14 @@ LAUNCH_AGENT_PLIST="$LAUNCH_AGENT_DIR/${LAUNCH_AGENT_LABEL}.plist"
 LAUNCH_AGENT_STDOUT="$SERVER_DIR/launchagent.out.log"
 LAUNCH_AGENT_STDERR="$SERVER_DIR/launchagent.err.log"
 
+# SESF-7: hourly backfill agent — independent of the persistent server agent.
+# Decouples indexing throughput from MCP session lifecycle.
+BACKFILL_AGENT_LABEL="cc.lbruton.sessionflow-backfill"
+BACKFILL_AGENT_PLIST="$LAUNCH_AGENT_DIR/${BACKFILL_AGENT_LABEL}.plist"
+BACKFILL_AGENT_STDOUT="$SERVER_DIR/backfill-agent.out.log"
+BACKFILL_AGENT_STDERR="$SERVER_DIR/backfill-agent.err.log"
+BACKFILL_INTERVAL_SECONDS="${SESSIONFLOW_BACKFILL_INTERVAL_SECONDS:-3600}"
+
 mkdir -p "$SERVER_DIR"
 
 # is_heartbeat_fresh determines whether HEARTBEAT_FILE and PID_FILE exist and whether the heartbeat's `timestamp` is within WATCHDOG_STALE_THRESHOLD seconds and its `pid` matches the PID stored in PID_FILE. Exits with status 0 if the heartbeat is fresh and matches the expected PID, non-zero otherwise.
@@ -339,6 +347,98 @@ do_uninstall_agent() {
     fi
 }
 
+write_backfill_agent_plist() {
+    mkdir -p "$LAUNCH_AGENT_DIR"
+    cat > "$BACKFILL_AGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyLists-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${BACKFILL_AGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${PYTHON}</string>
+        <string>${SCRIPT_DIR}/cleanup.py</string>
+        <string>backfill</string>
+        <string>enqueue</string>
+        <string>--provider</string>
+        <string>claude_code_cli</string>
+        <string>--mode</string>
+        <string>incremental</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>${BACKFILL_INTERVAL_SECONDS}</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${HOME}</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>${BACKFILL_AGENT_STDOUT}</string>
+    <key>StandardErrorPath</key>
+    <string>${BACKFILL_AGENT_STDERR}</string>
+    <key>WorkingDirectory</key>
+    <string>${SCRIPT_DIR}</string>
+</dict>
+</plist>
+PLIST
+}
+
+do_install_backfill_agent() {
+    local target
+    target=$(launch_agent_target)
+    if launchctl print "${target}/${BACKFILL_AGENT_LABEL}" >/dev/null 2>&1; then
+        launchctl bootout "$target" "$BACKFILL_AGENT_PLIST" 2>/dev/null || true
+    fi
+    write_backfill_agent_plist
+    if launchctl bootstrap "$target" "$BACKFILL_AGENT_PLIST" 2>/dev/null; then
+        echo "[sessionflow] Backfill LaunchAgent installed at $BACKFILL_AGENT_PLIST" >&2
+        echo "[sessionflow] Bootstrapped into $target (interval=${BACKFILL_INTERVAL_SECONDS}s)" >&2
+    else
+        launchctl enable "${target}/${BACKFILL_AGENT_LABEL}" 2>/dev/null || true
+        echo "[sessionflow] Backfill plist written at $BACKFILL_AGENT_PLIST" >&2
+        echo "[sessionflow] launchctl bootstrap reported a soft failure; tried enable." >&2
+    fi
+}
+
+do_uninstall_backfill_agent() {
+    local target
+    target=$(launch_agent_target)
+    if [ -f "$BACKFILL_AGENT_PLIST" ]; then
+        launchctl bootout "$target" "$BACKFILL_AGENT_PLIST" 2>/dev/null || true
+        rm -f "$BACKFILL_AGENT_PLIST"
+        echo "[sessionflow] Backfill LaunchAgent removed ($BACKFILL_AGENT_PLIST)" >&2
+    else
+        launchctl bootout "${target}/${BACKFILL_AGENT_LABEL}" 2>/dev/null || true
+        echo "[sessionflow] No backfill plist found at $BACKFILL_AGENT_PLIST" >&2
+    fi
+}
+
+do_backfill_agent_status() {
+    local target
+    target=$(launch_agent_target)
+    if [ -f "$BACKFILL_AGENT_PLIST" ]; then
+        echo "[sessionflow] Backfill plist: $BACKFILL_AGENT_PLIST (present)" >&2
+    else
+        echo "[sessionflow] Backfill plist: $BACKFILL_AGENT_PLIST (missing)" >&2
+    fi
+    if launchctl print "${target}/${BACKFILL_AGENT_LABEL}" >/dev/null 2>&1; then
+        echo "[sessionflow] Backfill LaunchAgent: loaded in ${target}" >&2
+        launchctl print "${target}/${BACKFILL_AGENT_LABEL}" \
+            | grep -E '^[[:space:]]*(state|last exit code|pid)[[:space:]]*=' \
+            | sed 's/^[[:space:]]*/  /' >&2 || true
+        exit 0
+    else
+        echo "[sessionflow] Backfill LaunchAgent: not loaded in ${target}" >&2
+        exit 1
+    fi
+}
+
 do_agent_status() {
     local target
     target=$(launch_agent_target)
@@ -372,8 +472,11 @@ case "${1:-start}" in
     install-agent)   do_install_agent ;;
     uninstall-agent) do_uninstall_agent ;;
     agent-status)    do_agent_status ;;
+    install-backfill-agent)   do_install_backfill_agent ;;
+    uninstall-backfill-agent) do_uninstall_backfill_agent ;;
+    backfill-agent-status)    do_backfill_agent_status ;;
     *)
-        echo "Usage: $0 {start|stop|status|restart|install-agent|uninstall-agent|agent-status}" >&2
+        echo "Usage: $0 {start|stop|status|restart|install-agent|uninstall-agent|agent-status|install-backfill-agent|uninstall-backfill-agent|backfill-agent-status}" >&2
         exit 1
         ;;
 esac

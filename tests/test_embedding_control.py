@@ -50,6 +50,34 @@ def test_embedding_identity_is_local_mlx_and_ignores_openai_env(monkeypatch):
     assert not hasattr(identity, "api_key")
 
 
+def test_default_max_turns_per_run_is_continuous_safe():
+    """SESF-12: a fresh-from-env budget must not silently cap a long-running server."""
+    from embedding_control import DEFAULT_MAX_TURNS_PER_RUN, EmbeddingBudget
+
+    assert DEFAULT_MAX_TURNS_PER_RUN >= 10_000
+    assert EmbeddingBudget().max_turns_per_run == DEFAULT_MAX_TURNS_PER_RUN
+    assert EmbeddingBudget.from_env().max_turns_per_run == DEFAULT_MAX_TURNS_PER_RUN
+
+
+def test_budget_warns_first_time_cap_is_hit(caplog):
+    """SESF-12: operator must see a distinct WARN the first time the cap denies inserts."""
+    import logging
+
+    from embedding_control import EmbeddingBudget
+
+    budget = EmbeddingBudget(batch_size=4, cooldown_ms=0, max_turns_per_run=4)
+    budget.after_batch(duration=0.01, turns=4)
+
+    with caplog.at_level(logging.WARNING, logger="sessionflow.embedding_budget"):
+        first = budget.before_batch(batch_size=4)
+        second = budget.before_batch(batch_size=4)
+
+    assert first.allowed is False
+    assert second.allowed is False
+    warns = [r for r in caplog.records if "MAX_TURNS_PER_RUN" in r.getMessage()]
+    assert len(warns) == 1, "expected exactly one WARN across repeated denials"
+
+
 def test_embedding_budget_records_cooldown_after_batch():
     from embedding_control import EmbeddingBudget
 

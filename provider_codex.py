@@ -14,6 +14,7 @@ from provider_adapters import (
     ProviderWatchRoot,
     build_source_id,
     canonicalize_path,
+    normalize_timestamp,
 )
 
 
@@ -126,7 +127,7 @@ class CodexAdapter:
                 path=str(first_path),
                 canonical_path=canonicalize_path(first_path),
                 project_root=project_root,
-                timestamp=timestamp,
+                timestamp=normalize_timestamp(timestamp),
                 status="eligible",
             ))
         return sources
@@ -189,7 +190,9 @@ class CodexAdapter:
                         "source_path": path,
                         "transcript_file": Path(path).name,
                         "turn_index": index,
-                        "timestamp": entry.get("timestamp") or record.get("timestamp") or source.timestamp,
+                        "timestamp": normalize_timestamp(
+                            entry.get("timestamp") or record.get("timestamp")
+                        ) or source.timestamp,
                         "git_branch": entry.get("git_branch") or record.get("git_branch", ""),
                         "chunk_type": "turn",
                         "project_root": source.project_root,

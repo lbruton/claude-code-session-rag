@@ -15,6 +15,7 @@ from provider_adapters import (
     ProviderWatchRoot,
     build_source_id,
     canonicalize_path,
+    normalize_timestamp,
 )
 
 
@@ -139,7 +140,7 @@ class AntigravityAdapter:
                 "source_path": source.path,
                 "transcript_file": Path(source.path).name,
                 "turn_index": step_index,
-                "timestamp": entry.get("timestamp", source.timestamp),
+                "timestamp": normalize_timestamp(entry.get("timestamp")) or source.timestamp,
                 "git_branch": "",
                 "chunk_type": entry.get("type", "turn"),
                 "project_root": source.project_root,

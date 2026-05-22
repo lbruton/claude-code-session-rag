@@ -121,6 +121,31 @@ def cmd_stats(args):
     print(f"\nDB location:  {db}")
 
 
+def cmd_migrate_schema(args):
+    """Drop and recreate the Milvus sessions collection to match current code.
+
+    SESF-11: explicit recovery path for the silent-DataNotMatchException class
+    of failures when fields are added to `_expected_schema_fields()`.
+    """
+    db = get_db_path()
+
+    if not args.yes:
+        answer = input(
+            "This drops the Milvus 'sessions' collection (all indexed turns lost). "
+            "Continue? [y/N] "
+        )
+        if answer.lower() != "y":
+            print("Cancelled.")
+            return
+
+    with rag_engine.milvus_client_for_migration(db_path=db) as client:
+        drift = rag_engine.detect_schema_drift(client)
+        if drift:
+            print(f"Detected schema drift: {drift}")
+        rag_engine.migrate_schema(client, db_path=db)
+    print("Schema migrated. Backfill the FTS sidecar via the server watcher.")
+
+
 def cmd_status(args):
     """Show provider-aware index, embedding, and backfill status."""
     db = get_db_path()
@@ -239,6 +264,13 @@ def build_parser():
     p_stats = subparsers.add_parser("stats", help="Show index statistics")
     p_stats.add_argument("--project", help="Filter to a specific project root")
 
+    # migrate-schema
+    p_migrate = subparsers.add_parser(
+        "migrate-schema",
+        help="Drop+recreate Milvus collection to match current schema (destructive)",
+    )
+    p_migrate.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+
     # status
     p_status = subparsers.add_parser("status", help="Show provider/backfill/embedding status")
     p_status.add_argument("--project", help="Filter to a specific project root")
@@ -268,6 +300,7 @@ def main():
         "delete": cmd_delete,
         "reset": cmd_reset,
         "stats": cmd_stats,
+        "migrate-schema": cmd_migrate_schema,
         "status": cmd_status,
         "backfill": cmd_backfill,
     }
