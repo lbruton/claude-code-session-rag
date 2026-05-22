@@ -31,6 +31,7 @@ LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
 LAUNCH_AGENT_PLIST="$LAUNCH_AGENT_DIR/${LAUNCH_AGENT_LABEL}.plist"
 LAUNCH_AGENT_STDOUT="$SERVER_DIR/launchagent.out.log"
 LAUNCH_AGENT_STDERR="$SERVER_DIR/launchagent.err.log"
+LAUNCHER_SCRIPT="$SERVER_DIR/sessionflow-launcher.sh"
 
 # SESF-7: hourly backfill agent — independent of the persistent server agent.
 # Decouples indexing throughput from MCP session lifecycle.
@@ -259,11 +260,123 @@ do_status() {
 
 # --- Optional LaunchAgent (user scope) ---
 
-# write_launch_agent_plist creates the user LaunchAgent plist that launches this
-# script with `start` at login. It is intentionally minimal: RunAtLoad only, no
-# KeepAlive (the in-process watchdog already restarts unresponsive servers).
+# write_user_launcher creates a home-directory launcher for hook/launchd
+# contexts that cannot execute scripts directly from /Volumes.
+write_user_launcher() {
+    cat > "$LAUNCHER_SCRIPT" <<LAUNCHER
+#!/bin/bash
+set -euo pipefail
+
+REPO_DIR="$SCRIPT_DIR"
+SERVER_DIR="\$HOME/.sessionflow"
+PID_FILE="\$SERVER_DIR/server.pid"
+LOG_FILE="\$SERVER_DIR/server.log"
+PYTHON="\$REPO_DIR/venv/bin/python"
+PORT="\${SESSIONFLOW_PORT:-7102}"
+HEALTH_URL="http://127.0.0.1:\$PORT/health"
+MAX_WAIT="\${SESSIONFLOW_START_MAX_WAIT:-60}"
+LAUNCH_AGENT_LABEL="$LAUNCH_AGENT_LABEL"
+LAUNCH_AGENT_PLIST="\$HOME/Library/LaunchAgents/\${LAUNCH_AGENT_LABEL}.plist"
+SESSIONFLOW_MILVUS_URI="\${SESSIONFLOW_MILVUS_URI:-http://192.168.1.81:19530}"
+
+mkdir -p "\$SERVER_DIR"
+
+is_healthy() {
+    curl -sf --max-time 5 "\$HEALTH_URL" >/dev/null 2>&1
+}
+
+is_pid_alive() {
+    [ -f "\$PID_FILE" ] && kill -0 "\$(cat "\$PID_FILE")" 2>/dev/null
+}
+
+wait_for_health() {
+    local server_pid="\${1:-}"
+    local waited=0
+    while [ "\$waited" -lt "\$MAX_WAIT" ]; do
+        sleep 1
+        waited=\$((waited + 1))
+
+        if [ -n "\$server_pid" ] && ! kill -0 "\$server_pid" 2>/dev/null; then
+            echo "[sessionflow-launcher] Server process died. Check \$LOG_FILE" >&2
+            exit 1
+        fi
+
+        if is_healthy; then
+            echo "[sessionflow-launcher] Server ready (\${waited}s)" >&2
+            exit 0
+        fi
+    done
+
+    echo "[sessionflow-launcher] Server failed to become healthy after \${MAX_WAIT}s. Check \$LOG_FILE" >&2
+    exit 1
+}
+
+start_server() {
+    if is_healthy; then
+        echo "[sessionflow-launcher] Already healthy on port \$PORT" >&2
+        exit 0
+    fi
+
+    if is_pid_alive; then
+        echo "[sessionflow-launcher] PID file exists but health failed; leaving process for watchdog/manual inspection: \$(cat "\$PID_FILE")" >&2
+        exit 1
+    fi
+
+    if [ -f "\$LAUNCH_AGENT_PLIST" ] && launchctl print "gui/\$(id -u)/\${LAUNCH_AGENT_LABEL}" >/dev/null 2>&1; then
+        launchctl kickstart -k "gui/\$(id -u)/\${LAUNCH_AGENT_LABEL}" >/dev/null 2>&1 || true
+        wait_for_health
+        exit \$?
+    fi
+
+    export PYTHONPATH="\$REPO_DIR"
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    export SESSIONFLOW_MILVUS_URI
+
+    cd "\$HOME"
+    nohup "\$PYTHON" -u "\$REPO_DIR/http_server.py" >> "\$LOG_FILE" 2>&1 &
+    wait_for_health "\$!"
+}
+
+run_server() {
+    export PYTHONPATH="\$REPO_DIR"
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    export SESSIONFLOW_MILVUS_URI
+
+    cd "\$HOME"
+    exec "\$PYTHON" -u "\$REPO_DIR/http_server.py" >> "\$LOG_FILE" 2>&1
+}
+
+case "\${1:-start}" in
+    start)
+        start_server
+        ;;
+    run)
+        run_server
+        ;;
+    status)
+        if is_healthy; then
+            echo "[sessionflow-launcher] Healthy on port \$PORT" >&2
+        else
+            echo "[sessionflow-launcher] Not healthy on port \$PORT" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Usage: \$0 [start|run|status]" >&2
+        exit 2
+        ;;
+esac
+LAUNCHER
+    chmod +x "$LAUNCHER_SCRIPT"
+}
+
+# write_launch_agent_plist creates the user LaunchAgent plist that launches the
+# home-directory launcher in foreground mode at login.
 write_launch_agent_plist() {
     mkdir -p "$LAUNCH_AGENT_DIR"
+    write_user_launcher
     cat > "$LAUNCH_AGENT_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyLists-1.0.dtd">
@@ -273,8 +386,8 @@ write_launch_agent_plist() {
     <string>${LAUNCH_AGENT_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${SCRIPT_DIR}/sessionflow-server.sh</string>
-        <string>start</string>
+        <string>${LAUNCHER_SCRIPT}</string>
+        <string>run</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -296,7 +409,7 @@ write_launch_agent_plist() {
     <key>StandardErrorPath</key>
     <string>${LAUNCH_AGENT_STDERR}</string>
     <key>WorkingDirectory</key>
-    <string>${SCRIPT_DIR}</string>
+    <string>${HOME}</string>
 </dict>
 </plist>
 PLIST
@@ -312,6 +425,7 @@ do_install_agent() {
     if [ ! -x "$SCRIPT_DIR/sessionflow-server.sh" ]; then
         chmod +x "$SCRIPT_DIR/sessionflow-server.sh"
     fi
+    write_user_launcher
     local target
     target=$(launch_agent_target)
     # If already bootstrapped, bootout first so the new plist takes effect.
