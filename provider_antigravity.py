@@ -122,11 +122,12 @@ class AntigravityAdapter:
                 continue
             # Antigravity transcripts use `created_at`; older / desktop variants
             # have also been seen with `timestamp`. Accept either.
-            raw_ts = (
-                entry.get("timestamp")
-                or entry.get("created_at")
-                or entry.get("createdAt")
-                or entry.get("time")
+            raw_ts = next(
+                (
+                    v for k in ("timestamp", "created_at", "createdAt", "time")
+                    if (v := entry.get(k)) is not None and v != ""
+                ),
+                None,
             )
             doc_hash = hashlib.sha256(
                 f"{source.logical_session_id}:{step_index}:{text}".encode("utf-8")

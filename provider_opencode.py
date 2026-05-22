@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import hashlib
 import json
+import logging
 import sqlite3
 import time
 
@@ -26,6 +27,8 @@ from provider_adapters import (
     canonicalize_path,
     normalize_timestamp,
 )
+
+logger = logging.getLogger("sessionflow.opencode")
 
 
 class OpenCodeAdapter:
@@ -68,7 +71,7 @@ class OpenCodeAdapter:
         if not self.db_path.exists():
             return None
         # `uri=True` lets us open in read-only mode and avoid mutating WAL.
-        uri = f"file:{self.db_path}?mode=ro"
+        uri = f"{self.db_path.as_uri()}?mode=ro"
         try:
             conn = sqlite3.connect(uri, uri=True, timeout=5.0)
         except sqlite3.Error:
@@ -135,6 +138,15 @@ class OpenCodeAdapter:
                 data.setdefault("sessionID", row["session_id"])
                 data.setdefault("__time_created_ms", row["time_created"])
                 self._parts_by_message.setdefault(str(row["message_id"]), []).append(data)
+            msg_count = sum(len(v) for v in self._messages_by_session.values())
+            part_count = sum(len(v) for v in self._parts_by_message.values())
+            if msg_count + part_count > 50_000:
+                logger.warning(
+                    "_refresh_db_indexes loaded %d messages and %d parts into memory; "
+                    "large OpenCode installs risk OOM — lazy per-session queries are recommended",
+                    msg_count,
+                    part_count,
+                )
         finally:
             conn.close()
         return sources
@@ -266,9 +278,13 @@ class OpenCodeAdapter:
             emitted.add(doc_id)
             raw_ts: object = ""
             if isinstance(message.get("time"), dict):
-                raw_ts = message["time"].get("created", "")
-            if not raw_ts:
-                raw_ts = message.get("__time_created_ms", "")
+                tc = message["time"].get("created")
+                if tc is not None and tc != "":
+                    raw_ts = tc
+            if raw_ts == "":
+                tc2 = message.get("__time_created_ms")
+                if tc2 is not None and tc2 != "":
+                    raw_ts = tc2
             turns.append({
                 "text": text,
                 "content": text,
