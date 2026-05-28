@@ -15,9 +15,11 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
+from urllib import error, request
 
 import rag_engine
 from embedding_control import EmbeddingIdentity, get_embedding_budget
@@ -26,6 +28,26 @@ from embedding_control import EmbeddingIdentity, get_embedding_budget
 def get_db_path() -> str:
     """Milvus URI — remote Standalone if SESSIONFLOW_MILVUS_URI is set, else local Lite."""
     return os.getenv("SESSIONFLOW_MILVUS_URI", str(Path.home() / ".sessionflow" / "milvus.db"))
+
+
+def get_server_url() -> str:
+    """Loopback SessionFlow server URL for local control endpoints."""
+    port = os.getenv("SESSIONFLOW_PORT", "7102")
+    return f"http://127.0.0.1:{port}"
+
+
+def post_backfill_action(payload: dict, timeout: float = 2.0) -> dict:
+    """POST a backfill action to the running HTTP server."""
+    body = json.dumps(payload).encode("utf-8")
+    req = request.Request(
+        f"{get_server_url()}/backfill",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with request.urlopen(req, timeout=timeout) as response:
+        response_body = response.read().decode("utf-8")
+    return json.loads(response_body) if response_body else {}
 
 
 def cmd_list(args):
@@ -224,8 +246,24 @@ def cmd_backfill(args) -> int:
                 print("Backfill enqueue requires --provider <name>", file=sys.stderr)
                 return 2
             mode = getattr(args, "mode", None) or "recent"
+            try:
+                post_backfill_action({
+                    "action": "enqueue",
+                    "provider": provider_kw,
+                    "mode": mode,
+                })
+                print(
+                    f"Backfill enqueued via running server: provider={provider_kw} mode={mode}"
+                )
+                return 0
+            except (OSError, error.URLError, TimeoutError) as exc:
+                print(
+                    f"Running server unavailable for enqueue ({exc}); "
+                    "falling back to local state file.",
+                    file=sys.stderr,
+                )
             job = manager.enqueue_provider_backfill(provider=provider_kw, mode=mode)
-            print(f"Backfill enqueued: provider={provider_kw} mode={mode} job_id={job.job_id}")
+            print(f"Backfill enqueued locally: provider={provider_kw} mode={mode} job_id={job.job_id}")
         elif action == "run":
             mode = getattr(args, "mode", None) or "incremental"
             providers_arg = getattr(args, "providers", None)

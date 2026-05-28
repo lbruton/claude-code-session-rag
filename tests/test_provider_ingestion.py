@@ -10,7 +10,6 @@ async def test_provider_ingestion_drains_codex_job_to_index_and_cursor(
     monkeypatch,
 ):
     import provider_ingestion
-    import rag_engine
     import transcript_parser
     from backfill_manager import BackfillManager
     from provider_codex import CodexAdapter
@@ -25,7 +24,7 @@ async def test_provider_ingestion_drains_codex_job_to_index_and_cursor(
         indexed_batches.append((turns, db_path))
         return len(turns)
 
-    monkeypatch.setattr(rag_engine, "add_turns_async", fake_add_turns)
+    monkeypatch.setattr(provider_ingestion.rag_engine, "add_turns_async", fake_add_turns)
 
     manager = BackfillManager(tmp_path / ".sessionflow" / "backfill_state.json")
     manager.enqueue_provider_backfill(provider="codex", mode="recent")
@@ -58,4 +57,3 @@ def test_provider_ingestion_startup_uses_recent_not_full(tmp_path):
     )
 
     assert {job.mode for job in manager.status().jobs} == {"recent"}
-

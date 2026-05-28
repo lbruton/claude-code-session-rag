@@ -209,6 +209,9 @@ def synthetic_antigravity_home(tmp_path):
 @pytest.fixture
 def stub_rag_engine(monkeypatch):
     """Stub the heavy rag_engine import for tests that inspect CLI/server formatting."""
+    async def add_turns_async(turns, *args, **kwargs):
+        return len(turns)
+
     module = types.SimpleNamespace(
         search=lambda *args, **kwargs: [],
         get_turns=lambda *args, **kwargs: [],
@@ -225,6 +228,7 @@ def stub_rag_engine(monkeypatch):
         clear_collection=lambda *args, **kwargs: None,
         init_server_mode=lambda *args, **kwargs: None,
         close_server_mode=lambda *args, **kwargs: None,
+        add_turns_async=add_turns_async,
         backfill_fts=lambda *args, **kwargs: 0,
         get_model=lambda *args, **kwargs: object(),
         get_model_name=lambda *args, **kwargs: "embeddinggemma",

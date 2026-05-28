@@ -4,6 +4,7 @@ Requirements: 6.6, 7, 8.
 """
 
 import importlib
+import json
 
 
 def test_cleanup_parser_supports_provider_status_and_backfill_controls(stub_rag_engine):
@@ -29,3 +30,62 @@ def test_cleanup_status_output_includes_provider_counts_and_embedding_identity(s
     assert "Provider" in output
     assert "Embedding" in output
     assert "Backfill" in output
+
+
+def test_cleanup_enqueue_prefers_running_server(stub_rag_engine, monkeypatch, capsys):
+    cleanup = importlib.import_module("cleanup")
+    posted = []
+
+    def fake_post(payload):
+        posted.append(payload)
+        return {"jobs": []}
+
+    monkeypatch.setattr(cleanup, "post_backfill_action", fake_post)
+
+    result = cleanup.cmd_backfill(type("Args", (), {
+        "action": "enqueue",
+        "provider": "opencode",
+        "mode": "full",
+    })())
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert posted == [{"action": "enqueue", "provider": "opencode", "mode": "full"}]
+    assert "via running server" in output
+
+
+def test_cleanup_enqueue_falls_back_to_local_state(stub_rag_engine, tmp_path, monkeypatch, capsys):
+    cleanup = importlib.import_module("cleanup")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cleanup, "post_backfill_action", lambda payload: (_ for _ in ()).throw(OSError("down")))
+
+    result = cleanup.cmd_backfill(type("Args", (), {
+        "action": "enqueue",
+        "provider": "opencode",
+        "mode": "full",
+    })())
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert "falling back to local state file" in captured.err
+    assert "Backfill enqueued locally" in captured.out
+
+
+def test_cleanup_enqueue_malformed_server_response_fails(stub_rag_engine, monkeypatch, capsys):
+    cleanup = importlib.import_module("cleanup")
+    monkeypatch.setattr(
+        cleanup,
+        "post_backfill_action",
+        lambda payload: (_ for _ in ()).throw(json.JSONDecodeError("bad json", "not-json", 0)),
+    )
+
+    result = cleanup.cmd_backfill(type("Args", (), {
+        "action": "enqueue",
+        "provider": "opencode",
+        "mode": "full",
+    })())
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "Backfill enqueue failed" in captured.err
+    assert "falling back" not in captured.err
