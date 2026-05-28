@@ -15,9 +15,11 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
+from urllib import error, request
 
 import rag_engine
 from embedding_control import EmbeddingIdentity, get_embedding_budget
@@ -26,6 +28,59 @@ from embedding_control import EmbeddingIdentity, get_embedding_budget
 def get_db_path() -> str:
     """Milvus URI — remote Standalone if SESSIONFLOW_MILVUS_URI is set, else local Lite."""
     return os.getenv("SESSIONFLOW_MILVUS_URI", str(Path.home() / ".sessionflow" / "milvus.db"))
+
+
+def get_server_url() -> str:
+    """Loopback SessionFlow server URL for local control endpoints."""
+    default_port = 7102
+    raw_port = os.getenv("SESSIONFLOW_PORT", str(default_port))
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        port = default_port
+    if not 1 <= port <= 65535:
+        port = default_port
+    return f"http://127.0.0.1:{port}"
+
+
+def post_backfill_action(payload: dict, timeout: float = 2.0) -> dict:
+    """POST a backfill action to the running HTTP server."""
+    body = json.dumps(payload).encode("utf-8")
+    req = request.Request(
+        f"{get_server_url()}/backfill",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with request.urlopen(req, timeout=timeout) as response:
+        response_body = response.read().decode("utf-8")
+    return json.loads(response_body) if response_body else {}
+
+
+def _http_error_message(exc: error.HTTPError) -> str:
+    """Extract a clear server rejection message from an HTTPError body."""
+    try:
+        response_body = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        return str(exc.reason)
+    if not response_body:
+        return str(exc.reason)
+    try:
+        parsed = json.loads(response_body)
+    except json.JSONDecodeError:
+        return response_body
+    if isinstance(parsed, dict):
+        detail = parsed.get("error") or parsed.get("detail")
+        if detail:
+            return str(detail)
+    return response_body
+
+
+def _print_server_rejected(action: str, exc: error.HTTPError) -> None:
+    print(
+        f"Server rejected backfill {action} request: {_http_error_message(exc)}",
+        file=sys.stderr,
+    )
 
 
 def cmd_list(args):
@@ -186,9 +241,15 @@ def cmd_backfill(args) -> int:
     """Control the provider-aware backfill queue."""
     from backfill_manager import BackfillManager
 
-    state_path = Path.home() / ".sessionflow" / "backfill_state.json"
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    manager = BackfillManager(state_path)
+    manager = None
+
+    def get_manager() -> BackfillManager:
+        nonlocal manager
+        if manager is None:
+            state_path = Path.home() / ".sessionflow" / "backfill_state.json"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            manager = BackfillManager(state_path)
+        return manager
 
     provider_arg = getattr(args, "provider", None)
     provider_label = provider_arg or "all"
@@ -197,7 +258,7 @@ def cmd_backfill(args) -> int:
 
     try:
         if action == "status":
-            status = manager.status()
+            status = get_manager().status()
             print(f"Backfill status (provider={provider_label}):")
             print(f"  Global paused: {status.paused}")
             print(f"  Queued jobs:   {len(status.jobs)}")
@@ -214,21 +275,67 @@ def cmd_backfill(args) -> int:
                     f"indexed_turns={pstatus.indexed_turns} errors={pstatus.error_count}"
                 )
         elif action == "pause":
-            manager.pause(provider=provider_kw)
+            get_manager().pause(provider=provider_kw)
             print(f"Backfill paused: provider={provider_label}")
         elif action == "resume":
-            manager.resume(provider=provider_kw)
+            get_manager().resume(provider=provider_kw)
             print(f"Backfill resumed: provider={provider_label}")
         elif action == "enqueue":
             if not provider_kw:
                 print("Backfill enqueue requires --provider <name>", file=sys.stderr)
                 return 2
             mode = getattr(args, "mode", None) or "recent"
-            job = manager.enqueue_provider_backfill(provider=provider_kw, mode=mode)
-            print(f"Backfill enqueued: provider={provider_kw} mode={mode} job_id={job.job_id}")
+            try:
+                post_backfill_action({
+                    "action": "enqueue",
+                    "provider": provider_kw,
+                    "mode": mode,
+                })
+                print(
+                    f"Backfill enqueued via running server: provider={provider_kw} mode={mode}"
+                )
+                return 0
+            except error.HTTPError as exc:
+                _print_server_rejected("enqueue", exc)
+                return 1
+            except (OSError, error.URLError, TimeoutError) as exc:
+                print(
+                    f"Running server unavailable for enqueue ({exc}); "
+                    "falling back to local state file.",
+                    file=sys.stderr,
+                )
+            job = get_manager().enqueue_provider_backfill(provider=provider_kw, mode=mode)
+            print(f"Backfill enqueued locally: provider={provider_kw} mode={mode} job_id={job.job_id}")
         elif action == "run":
             mode = getattr(args, "mode", None) or "incremental"
             providers_arg = getattr(args, "providers", None)
+            payload = {"action": "run", "mode": mode}
+            if providers_arg:
+                payload["providers"] = providers_arg
+            try:
+                server_result = post_backfill_action(payload)
+                run_result = server_result.get("run", {}) if isinstance(server_result, dict) else {}
+                totals = run_result.get("totals", {}) if isinstance(run_result, dict) else {}
+                skipped = run_result.get("skipped", []) if isinstance(run_result, dict) else []
+                skipped_summary = f" skipped={','.join(skipped)}" if skipped else ""
+                print(
+                    f"Backfill run complete via running server (mode={mode}): "
+                    f"jobs={totals.get('jobs', 0)} "
+                    f"processed_sources={totals.get('processed_sources', 0)} "
+                    f"indexed_turns={totals.get('indexed_turns', 0)} "
+                    f"errors={totals.get('errors', 0)}"
+                    f"{skipped_summary}"
+                )
+                return 0
+            except error.HTTPError as exc:
+                _print_server_rejected("run", exc)
+                return 1
+            except (OSError, error.URLError, TimeoutError) as exc:
+                print(
+                    f"Running server unavailable for run ({exc}); "
+                    "falling back to local enqueue and drain.",
+                    file=sys.stderr,
+                )
             if providers_arg:
                 providers = [p.strip() for p in providers_arg.split(",") if p.strip()]
             else:
@@ -240,7 +347,7 @@ def cmd_backfill(args) -> int:
             db = get_db_path()
             for provider in providers:
                 try:
-                    manager.enqueue_provider_backfill(provider=provider, mode=mode)
+                    get_manager().enqueue_provider_backfill(provider=provider, mode=mode)
                 except ValueError as exc:
                     print(f"Skipping {provider}: {exc}", file=sys.stderr)
             # SESF-8: add_turns_async requires the dedicated MLX executor.
@@ -249,7 +356,7 @@ def cmd_backfill(args) -> int:
             rag_engine.init_server_mode(db_path=db)
             try:
                 totals = asyncio.run(
-                    ProviderIngestionService(manager, db).process_queued_jobs()
+                    ProviderIngestionService(get_manager(), db).process_queued_jobs()
                 )
             finally:
                 rag_engine.close_server_mode()

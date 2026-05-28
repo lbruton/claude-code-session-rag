@@ -59,6 +59,22 @@ _SERVER_DIR = Path.home() / ".sessionflow"
 PID_FILE = _SERVER_DIR / "server.pid"
 LOG_FILE = _SERVER_DIR / "server.log"
 
+
+def _parse_backfill_drain_interval() -> float:
+    raw_interval = os.getenv("SESSIONFLOW_BACKFILL_DRAIN_INTERVAL_SECONDS", "30")
+    try:
+        interval = float(raw_interval)
+    except ValueError as exc:
+        raise ValueError(
+            "SESSIONFLOW_BACKFILL_DRAIN_INTERVAL_SECONDS must be a number"
+        ) from exc
+    return interval
+
+
+BACKFILL_DRAIN_INTERVAL = _parse_backfill_drain_interval()
+if BACKFILL_DRAIN_INTERVAL <= 0:
+    raise ValueError("SESSIONFLOW_BACKFILL_DRAIN_INTERVAL_SECONDS must be > 0")
+
 # Milvus backend: remote Standalone URI or local Lite file path.
 MILVUS_URI = os.getenv("SESSIONFLOW_MILVUS_URI", str(_SERVER_DIR / "milvus.db"))
 HEARTBEAT_FILE = _SERVER_DIR / "heartbeat"
@@ -188,11 +204,89 @@ _model_loaded = False
 _server_mode_ready = False
 _BACKFILL_STATE = _SERVER_DIR / "backfill_state.json"
 _backfill_manager = BackfillManager(_BACKFILL_STATE)
+_backfill_drain_event: asyncio.Event | None = None
+_backfill_drain_lock: asyncio.Lock | None = None
 
 # TTL cache for provider health — avoid expensive I/O on every /health probe.
 _PROVIDER_HEALTH_TTL = 30  # seconds
 _provider_health_cache: dict | None = None
 _provider_health_cache_ts: float = 0.0
+
+
+def _ensure_backfill_drain_primitives() -> None:
+    """Create loop-bound primitives lazily inside the running event loop."""
+    global _backfill_drain_event, _backfill_drain_lock
+    if _backfill_drain_event is None:
+        _backfill_drain_event = asyncio.Event()
+    if _backfill_drain_lock is None:
+        _backfill_drain_lock = asyncio.Lock()
+
+
+def _wake_backfill_drain() -> None:
+    """Wake the background drain worker after queue-changing HTTP actions."""
+    if _backfill_drain_event is not None:
+        # Current callers are async HTTP handlers on the event-loop thread.
+        _backfill_drain_event.set()
+
+
+async def _drain_backfill_once(skip_if_locked: bool = True) -> dict:
+    """Drain queued provider jobs once without overlapping another drain."""
+    _ensure_backfill_drain_primitives()
+    lock = _backfill_drain_lock
+    if lock is None:
+        return {"jobs": 0, "processed_sources": 0, "indexed_turns": 0, "errors": 0}
+    if skip_if_locked and lock.locked():
+        return {"jobs": 0, "processed_sources": 0, "indexed_turns": 0, "errors": 0, "skipped": 1}
+
+    async with lock:
+        status = _backfill_manager.status()
+        if status.paused or not status.jobs:
+            return {"jobs": 0, "processed_sources": 0, "indexed_turns": 0, "errors": 0}
+        return await ProviderIngestionService(_backfill_manager, MILVUS_URI).process_queued_jobs()
+
+
+async def _backfill_drain_worker(interval: float = BACKFILL_DRAIN_INTERVAL) -> None:
+    """Poll and drain durable backfill jobs while the HTTP server is alive."""
+    _ensure_backfill_drain_primitives()
+    event = _backfill_drain_event
+    if event is None:
+        return
+    while True:
+        event.clear()
+        try:
+            await _drain_backfill_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Backfill drain worker failed")
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _process_startup_provider_backfill_locked(
+    db_path: str,
+    enabled_providers: list[str],
+    mode: str,
+    startup_delay: float,
+) -> dict:
+    """Run startup provider backfill under the shared drain lock."""
+    _ensure_backfill_drain_primitives()
+    lock = _backfill_drain_lock
+    if lock is None:
+        return {}
+    if startup_delay > 0:
+        await asyncio.sleep(startup_delay)
+    async with lock:
+        return await process_startup_provider_backfill(
+            _backfill_manager,
+            db_path,
+            enabled_providers=enabled_providers,
+            mode=mode,
+            startup_delay=0,
+        )
 
 
 def _provider_health(deep: bool = False) -> dict:
@@ -310,13 +404,13 @@ async def backfill_control_endpoint(request: Request) -> JSONResponse:
             since=body.get("since", ""),
             priority=priority,
         )
+        _wake_backfill_drain()
     elif action == "run":
         # Hourly LaunchAgent entrypoint: enqueue every enabled provider in the
         # requested mode and drain the queue inline using the server's already
         # warmed-up MLX executor. Avoids the multi-process Metal risk of
         # spinning up a parallel MLX context from cleanup.py.
         from provider_adapters import LEGAL_PROVIDERS
-        from provider_ingestion import ProviderIngestionService
 
         mode = body.get("mode", "incremental")
         _VALID_MODES = {"recent", "incremental", "full"}
@@ -338,9 +432,7 @@ async def backfill_control_endpoint(request: Request) -> JSONResponse:
                 _backfill_manager.enqueue_provider_backfill(provider=provider, mode=mode)
             except ValueError:
                 skipped.append(provider)
-        totals = await ProviderIngestionService(
-            _backfill_manager, MILVUS_URI
-        ).process_queued_jobs()
+        totals = await _drain_backfill_once(skip_if_locked=False)
         payload = _backfill_status_payload()
         payload["run"] = {
             "mode": mode,
@@ -528,7 +620,7 @@ async def lifespan(app: Starlette):
     PID_FILE.write_text(str(os.getpid()))
     print(f"[HTTP] PID {os.getpid()} written to {PID_FILE}", file=sys.stderr)
 
-    global _model_loaded, _server_mode_ready
+    global _model_loaded, _server_mode_ready, _backfill_drain_event, _backfill_drain_lock
 
     # Pre-load embedding model
     try:
@@ -550,6 +642,9 @@ async def lifespan(app: Starlette):
     heartbeat = HeartbeatThread(HEARTBEAT_FILE)
     heartbeat.start()
     print(f"[HTTP] Heartbeat thread started ({HEARTBEAT_FILE})", file=sys.stderr)
+
+    _ensure_backfill_drain_primitives()
+    backfill_drain_task = asyncio.create_task(_backfill_drain_worker())
 
     # Backfill FTS from Milvus for any records indexed before FTS was added.
     # Runs as a background task so it doesn't block HTTP server binding.
@@ -584,8 +679,7 @@ async def lifespan(app: Starlette):
             ]
             mode = get_embedding_budget().mode
             # Delay lets HTTP server finish binding before bounded provider work starts.
-            asyncio.create_task(process_startup_provider_backfill(
-                _backfill_manager,
+            asyncio.create_task(_process_startup_provider_backfill_locked(
                 db_path,
                 enabled_providers=enabled_providers,
                 mode=mode,
@@ -602,6 +696,11 @@ async def lifespan(app: Starlette):
             pass
 
     heartbeat.stop()
+    backfill_drain_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await backfill_drain_task
+    _backfill_drain_event = None
+    _backfill_drain_lock = None
     if HEARTBEAT_FILE.exists():
         try:
             data = json.loads(HEARTBEAT_FILE.read_text())
