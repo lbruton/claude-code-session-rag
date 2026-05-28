@@ -6,6 +6,7 @@ import sys
 import time
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -209,7 +210,11 @@ def synthetic_antigravity_home(tmp_path):
 @pytest.fixture
 def stub_rag_engine(monkeypatch):
     """Stub the heavy rag_engine import for tests that inspect CLI/server formatting."""
-    async def add_turns_async(turns, *args, **kwargs):
+    async def add_turns_async(
+        turns: list[dict[str, Any]],
+        *args: object,
+        **kwargs: object,
+    ) -> int:
         return len(turns)
 
     module = types.SimpleNamespace(
