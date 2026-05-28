@@ -58,7 +58,20 @@ _EXPIRE_CHECK_INTERVAL = 86400  # Check once per day
 _SERVER_DIR = Path.home() / ".sessionflow"
 PID_FILE = _SERVER_DIR / "server.pid"
 LOG_FILE = _SERVER_DIR / "server.log"
-BACKFILL_DRAIN_INTERVAL = float(os.getenv("SESSIONFLOW_BACKFILL_DRAIN_INTERVAL_SECONDS", "30"))
+
+
+def _parse_backfill_drain_interval() -> float:
+    raw_interval = os.getenv("SESSIONFLOW_BACKFILL_DRAIN_INTERVAL_SECONDS", "30")
+    try:
+        interval = float(raw_interval)
+    except ValueError as exc:
+        raise ValueError(
+            "SESSIONFLOW_BACKFILL_DRAIN_INTERVAL_SECONDS must be a number"
+        ) from exc
+    return interval
+
+
+BACKFILL_DRAIN_INTERVAL = _parse_backfill_drain_interval()
 if BACKFILL_DRAIN_INTERVAL <= 0:
     raise ValueError("SESSIONFLOW_BACKFILL_DRAIN_INTERVAL_SECONDS must be > 0")
 
@@ -216,13 +229,13 @@ def _wake_backfill_drain() -> None:
         _backfill_drain_event.set()
 
 
-async def _drain_backfill_once() -> dict:
+async def _drain_backfill_once(skip_if_locked: bool = True) -> dict:
     """Drain queued provider jobs once without overlapping another drain."""
     _ensure_backfill_drain_primitives()
     lock = _backfill_drain_lock
     if lock is None:
         return {"jobs": 0, "processed_sources": 0, "indexed_turns": 0, "errors": 0}
-    if lock.locked():
+    if skip_if_locked and lock.locked():
         return {"jobs": 0, "processed_sources": 0, "indexed_turns": 0, "errors": 0, "skipped": 1}
 
     async with lock:
@@ -419,7 +432,7 @@ async def backfill_control_endpoint(request: Request) -> JSONResponse:
                 _backfill_manager.enqueue_provider_backfill(provider=provider, mode=mode)
             except ValueError:
                 skipped.append(provider)
-        totals = await _drain_backfill_once()
+        totals = await _drain_backfill_once(skip_if_locked=False)
         payload = _backfill_status_payload()
         payload["run"] = {
             "mode": mode,

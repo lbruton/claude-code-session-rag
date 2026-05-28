@@ -31,6 +31,14 @@ def test_local_backfill_control_endpoint_exists(stub_rag_engine):
     assert "/backfill" in routes or "/backfill/control" in routes
 
 
+def test_backfill_drain_interval_rejects_non_numeric_value(stub_rag_engine, monkeypatch):
+    http_server = importlib.import_module("http_server")
+
+    monkeypatch.setenv("SESSIONFLOW_BACKFILL_DRAIN_INTERVAL_SECONDS", "bad")
+    with pytest.raises(ValueError, match="must be a number"):
+        http_server._parse_backfill_drain_interval()
+
+
 @contextmanager
 def _backfill_client(stub_rag_engine, tmp_path, monkeypatch):
     """Reload http_server with the rag_engine stub in place and wrap it in a
@@ -184,7 +192,10 @@ async def test_backfill_run_action_uses_shared_drain_path(stub_rag_engine, tmp_p
                     "providers": ["opencode"],
                 }
 
-        async def fake_drain():
+        drain_kwargs = []
+
+        async def fake_drain(*args, **kwargs):
+            drain_kwargs.append(kwargs)
             return {"jobs": 1, "processed_sources": 0, "indexed_turns": 0, "errors": 0}
 
         monkeypatch.setattr(http_server, "_drain_backfill_once", fake_drain)
@@ -194,3 +205,4 @@ async def test_backfill_run_action_uses_shared_drain_path(stub_rag_engine, tmp_p
 
         assert response.status_code == 200
         assert '"jobs":1' in payload.replace(" ", "")
+        assert drain_kwargs == [{"skip_if_locked": False}]
