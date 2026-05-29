@@ -1125,7 +1125,7 @@ def delete_older_than(max_age_days: int, db_path: Optional[str] = None) -> int:
 
     Returns the number of deleted turns.
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import timedelta
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
     cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
