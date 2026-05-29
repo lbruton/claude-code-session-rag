@@ -231,6 +231,17 @@ def test_recency_score_future_timestamp_clamps_to_one():
     assert rag_engine._recency_score(future, NOW, decay_days=7) == pytest.approx(1.0)
 
 
+def test_recency_score_parses_z_suffix_timestamp():
+    """Real Claude transcripts emit a trailing 'Z'; it must parse as UTC and not
+    fall back to the neutral 0.5 (the bug fixed in PR #20 review)."""
+    z_ts = "2026-05-25T12:00:00Z"  # exactly 3 days before NOW, Zulu suffix
+    plus_ts = "2026-05-25T12:00:00+00:00"
+    s_z = rag_engine._recency_score(z_ts, NOW, decay_days=7)
+    s_plus = rag_engine._recency_score(plus_ts, NOW, decay_days=7)
+    assert s_z == pytest.approx(s_plus, rel=1e-6)
+    assert s_z != pytest.approx(rag_engine.MISSING_TIMESTAMP_RECENCY)
+
+
 # --- EARS-8: missing-timestamp fallback ---
 
 def test_recency_score_missing_timestamp_is_neutral():
@@ -258,6 +269,15 @@ def test_env_float_falls_back_on_unparseable(monkeypatch):
 
 def test_env_float_falls_back_when_out_of_range(monkeypatch):
     monkeypatch.setenv("SESSIONFLOW_RECENCY_WEIGHT", "1.5")
+    assert embedding_control._env_float("SESSIONFLOW_RECENCY_WEIGHT", 0.3, 0.0, 1.0) == pytest.approx(0.3)
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "Infinity"])
+def test_env_float_falls_back_on_non_finite(monkeypatch, bad):
+    """float('nan'/'inf') parse cleanly and slip past min/max bounds (every NaN
+    comparison is False), so they must be rejected explicitly — otherwise NaN
+    propagates into hybrid scores and corrupts sort order (PR #20 review)."""
+    monkeypatch.setenv("SESSIONFLOW_RECENCY_WEIGHT", bad)
     assert embedding_control._env_float("SESSIONFLOW_RECENCY_WEIGHT", 0.3, 0.0, 1.0) == pytest.approx(0.3)
 
 

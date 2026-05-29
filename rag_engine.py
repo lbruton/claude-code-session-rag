@@ -17,7 +17,7 @@ import hashlib
 import json
 import math
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Block all HuggingFace network access at runtime.
@@ -836,6 +836,11 @@ def _parse_timestamp_utc(ts: str) -> Optional[datetime]:
     """
     if not ts:
         return None
+    # Real-world transcripts (Claude Code JSONL et al.) emit a trailing "Z" for
+    # UTC. datetime.fromisoformat only accepts it on Python 3.11+, so normalize
+    # explicitly to stay correct regardless of interpreter version.
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
     try:
         parsed = datetime.fromisoformat(ts)
     except (ValueError, TypeError):
@@ -907,7 +912,7 @@ def _rank_results(results: List[Dict], sort_by: str, n: int,
             "SESSIONFLOW_RECENCY_DECAY_DAYS", RECENCY_DECAY_DAYS_DEFAULT, minimum=1
         )
         semantic = _semantic_scores(results)
-        for r, sem in zip(results, semantic):
+        for r, sem in zip(results, semantic, strict=True):
             rec = _recency_score(r.get("timestamp", ""), now, decay_days)
             r["_semantic_score"] = sem
             r["_recency_score"] = rec
@@ -1125,8 +1130,6 @@ def delete_older_than(max_age_days: int, db_path: Optional[str] = None) -> int:
 
     Returns the number of deleted turns.
     """
-    from datetime import timedelta
-
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
     cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
 

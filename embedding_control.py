@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
+import math
 import os
 import time
 from typing import Optional
@@ -50,6 +51,11 @@ def _env_float(
     try:
         value = float(raw)
     except ValueError:
+        return default
+    # NaN/Inf parse cleanly via float() but slip past the bounds checks below
+    # (every NaN comparison is False), so reject non-finite values explicitly —
+    # NaN would otherwise propagate into hybrid scores and corrupt sort order.
+    if not math.isfinite(value):
         return default
     if minimum is not None and value < minimum:
         return default

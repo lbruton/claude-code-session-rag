@@ -33,6 +33,21 @@ def get_db_path() -> str:
     return os.getenv("SESSIONFLOW_MILVUS_URI", str(Path.home() / ".sessionflow" / "milvus.db"))
 
 
+def _validate_enum_arg(name: str, value, legal_values) -> "types.TextContent | None":
+    """Return an error TextContent if `value` is non-None and outside `legal_values`.
+
+    Shared by the search handlers so provider/source_kind/sort_by validation stays
+    consistent in one place rather than duplicated per tool.
+    """
+    if value is not None and value not in legal_values:
+        allowed = ", ".join(sorted(legal_values))
+        return types.TextContent(
+            type="text",
+            text=f"Invalid {name}: {value!r}; expected one of: {allowed}",
+        )
+    return None
+
+
 # --- Formatting helpers ---
 
 def format_results(results: list[dict]) -> str:
@@ -169,8 +184,8 @@ def build_search_all_sessions_schema() -> dict:
             },
             "sort_by": {
                 "type": "string",
-                "enum": ["relevance", "recency", "hybrid"],
-                "description": "Ranking strategy: 'relevance' (pure semantic), 'recency' (newest first), or 'hybrid' (blended, default).",
+                "enum": sorted(LEGAL_SORT_BY),
+                "description": "Ranking strategy: 'relevance' (pure RRF relevance), 'recency' (newest first), or 'hybrid' (blended, default).",
                 "default": "hybrid",
             },
             "date_from": {
@@ -311,12 +326,9 @@ def register_tools(server: Server):
             if name == "search_session":
                 session_id = arguments.get("session_id")
                 sort_by_arg = arguments.get("sort_by", "hybrid")
-                if sort_by_arg not in LEGAL_SORT_BY:
-                    allowed = ", ".join(sorted(LEGAL_SORT_BY))
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Invalid sort_by: {sort_by_arg!r}; expected one of: {allowed}",
-                    )]
+                err = _validate_enum_arg("sort_by", sort_by_arg, LEGAL_SORT_BY)
+                if err:
+                    return [err]
                 results = rag_engine.search(
                     arguments["query"],
                     arguments.get("n", 5),
@@ -340,24 +352,13 @@ def register_tools(server: Server):
                 provider_arg = arguments.get("provider")
                 source_kind_arg = arguments.get("source_kind")
                 sort_by_arg = arguments.get("sort_by", "hybrid")
-                if provider_arg is not None and provider_arg not in LEGAL_PROVIDERS:
-                    allowed = ", ".join(sorted(LEGAL_PROVIDERS))
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Invalid provider: {provider_arg!r}; expected one of: {allowed}",
-                    )]
-                if source_kind_arg is not None and source_kind_arg not in LEGAL_SOURCE_KINDS:
-                    allowed = ", ".join(sorted(LEGAL_SOURCE_KINDS))
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Invalid source_kind: {source_kind_arg!r}; expected one of: {allowed}",
-                    )]
-                if sort_by_arg not in LEGAL_SORT_BY:
-                    allowed = ", ".join(sorted(LEGAL_SORT_BY))
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Invalid sort_by: {sort_by_arg!r}; expected one of: {allowed}",
-                    )]
+                for err in (
+                    _validate_enum_arg("provider", provider_arg, LEGAL_PROVIDERS),
+                    _validate_enum_arg("source_kind", source_kind_arg, LEGAL_SOURCE_KINDS),
+                    _validate_enum_arg("sort_by", sort_by_arg, LEGAL_SORT_BY),
+                ):
+                    if err:
+                        return [err]
 
                 results = rag_engine.search(
                     arguments["query"],
