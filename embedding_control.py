@@ -33,6 +33,31 @@ def _env_int(name: str, default: int, minimum: Optional[int] = None) -> int:
     return value
 
 
+def _env_float(
+    name: str,
+    default: float,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
+    """Read a float env var, falling back to ``default`` on bad input.
+
+    Unlike ``_env_int`` (which clamps to ``minimum``), an unparseable value OR a
+    value outside ``[minimum, maximum]`` returns ``default`` rather than clamping.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if minimum is not None and value < minimum:
+        return default
+    if maximum is not None and value > maximum:
+        return default
+    return value
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:

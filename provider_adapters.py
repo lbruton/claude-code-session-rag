@@ -38,6 +38,12 @@ LEGAL_SOURCE_CLASSES = frozenset({
     "fallback",
 })
 
+LEGAL_SORT_BY = frozenset({
+    "relevance",
+    "recency",
+    "hybrid",
+})
+
 LEGAL_SOURCE_STATUSES = frozenset({
     "eligible",
     "pending",
