@@ -47,7 +47,9 @@ def test_mcp_search_schema_exposes_optional_provider_filters_without_requiring_t
 
     assert "provider" in schema["properties"]
     assert "source_kind" in schema["properties"]
-    assert schema["required"] == ["query"]
+    # SESF-16: query is now optional (empty query → recency listing), so the
+    # schema requires no fields.
+    assert schema["required"] == []
 
 
 def test_search_rejects_invalid_provider_before_hitting_milvus(monkeypatch):

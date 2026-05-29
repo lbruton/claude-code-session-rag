@@ -51,6 +51,11 @@ from provider_adapters import (
 RECENCY_WEIGHT_DEFAULT = 0.3
 RECENCY_DECAY_DAYS_DEFAULT = 7
 MISSING_TIMESTAMP_RECENCY = 0.5
+# Query-less recency listing (SESF-16): Milvus query() has no ORDER BY, so we
+# scan a filter-bounded candidate set and sort by timestamp client-side. Capped
+# to mirror get_turns/get_stats. Correct for a single project under the cap;
+# best-effort (newest within the first cap rows scanned) for cross-project.
+RECENT_LISTING_SCAN_CAP = 16384
 _RANKING_SCRATCH_KEYS = ("_rrf_score", "_score", "_semantic_score", "_recency_score")
 
 logger = logging.getLogger("sessionflow.milvus")
@@ -670,6 +675,34 @@ def _escape_filter_scalar(value: str) -> str:
     return value.replace('"', '""')
 
 
+def _build_milvus_filter(session_id: Optional[str], git_branch: Optional[str],
+                         project_root: Optional[str], provider: Optional[str],
+                         source_kind: Optional[str], date_from: Optional[str],
+                         date_to: Optional[str]) -> Optional[str]:
+    """Compose the Milvus boolean-expression filter shared by vector search and
+    the query-less recency listing. Returns None when no filters apply.
+
+    provider/source_kind are validated against allowlists before reaching here,
+    so they are interpolated directly; user-supplied scalars are escaped.
+    """
+    filters = []
+    if session_id:
+        filters.append(f'session_id == "{_escape_filter_scalar(session_id)}"')
+    if git_branch:
+        filters.append(f'git_branch == "{_escape_filter_scalar(git_branch)}"')
+    if project_root:
+        filters.append(f'project_root == "{_escape_filter_scalar(project_root)}"')
+    if provider:
+        filters.append(f'provider == "{provider}"')
+    if source_kind:
+        filters.append(f'source_kind == "{source_kind}"')
+    if date_from:
+        filters.append(f'timestamp >= "{date_from}"')
+    if date_to:
+        filters.append(f'timestamp <= "{date_to}T23:59:59"')
+    return " && ".join(filters) if filters else None
+
+
 def search(query: str, n: int = 5, session_id: Optional[str] = None,
            git_branch: Optional[str] = None, project_root: Optional[str] = None,
            sort_by: str = "hybrid",
@@ -710,28 +743,28 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
             f"Invalid source_kind: {source_kind!r}; expected one of: {allowed}"
         )
 
+    # Query-less recency listing (SESF-16): with no query there is no vector to
+    # match and nothing for FTS, so fall back to a filter-only chronological
+    # listing regardless of sort_by. Branches before embed_texts so an empty
+    # string never produces a degenerate query vector.
+    if not (query or "").strip():
+        return _recent_listing(
+            n, session_id=session_id, git_branch=git_branch,
+            project_root=project_root, provider=provider,
+            source_kind=source_kind, date_from=date_from, date_to=date_to,
+            db_path=db_path,
+        )
+
     # Expanded candidate pool for both engines
     fetch_n = n * 3
 
     # --- Vector search ---
     query_embedding = embed_texts([query], is_query=True)[0]
 
-    filters = []
-    if session_id:
-        filters.append(f'session_id == "{_escape_filter_scalar(session_id)}"')
-    if git_branch:
-        filters.append(f'git_branch == "{_escape_filter_scalar(git_branch)}"')
-    if project_root:
-        filters.append(f'project_root == "{_escape_filter_scalar(project_root)}"')
-    if provider:
-        filters.append(f'provider == "{provider}"')
-    if source_kind:
-        filters.append(f'source_kind == "{source_kind}"')
-    if date_from:
-        filters.append(f'timestamp >= "{date_from}"')
-    if date_to:
-        filters.append(f'timestamp <= "{date_to}T23:59:59"')
-    filter_expr = " && ".join(filters) if filters else None
+    filter_expr = _build_milvus_filter(
+        session_id, git_branch, project_root, provider, source_kind,
+        date_from, date_to,
+    )
 
     search_params = {"metric_type": "COSINE"}
     if _is_remote_uri(db_path or ""):
@@ -826,6 +859,66 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
         pass
 
     return merged[:n]
+
+
+def _recent_listing(n: int, session_id: Optional[str] = None,
+                    git_branch: Optional[str] = None,
+                    project_root: Optional[str] = None,
+                    provider: Optional[str] = None,
+                    source_kind: Optional[str] = None,
+                    date_from: Optional[str] = None,
+                    date_to: Optional[str] = None,
+                    db_path: Optional[str] = None) -> List[Dict]:
+    """Query-less chronological listing: filter-only Milvus scan re-ranked by
+    timestamp descending (SESF-16).
+
+    Milvus ``query()`` has no ORDER BY, so we scan up to
+    ``RECENT_LISTING_SCAN_CAP`` filter-matching rows and sort client-side. For a
+    single project under the cap this returns the true newest rows; for very
+    large or cross-project scans it returns the newest within the scanned set.
+    """
+    filter_expr = _build_milvus_filter(
+        session_id, git_branch, project_root, provider, source_kind,
+        date_from, date_to,
+    )
+
+    with milvus_client(db_path) as client:
+        rows = client.query(
+            collection_name=COLLECTION_NAME,
+            filter=filter_expr or "",
+            output_fields=["document", "doc_id", "session_id", "transcript_file",
+                           "turn_index", "timestamp", "git_branch", "chunk_type",
+                           "project_root", "logical_session_id", "provider",
+                           "source_kind", "source_class", "source_id", "source_path"],
+            limit=RECENT_LISTING_SCAN_CAP,
+        )
+
+    if not rows:
+        return []
+
+    defaults = default_provider_metadata()
+    mapped = []
+    for row in rows:
+        mapped.append({
+            "content": row.get("document", ""),
+            "doc_id": row.get("doc_id", ""),
+            "session_id": row.get("session_id", ""),
+            "logical_session_id": row.get("logical_session_id", row.get("session_id", "")),
+            "provider": row.get("provider", defaults["provider"]),
+            "source_kind": row.get("source_kind", defaults["source_kind"]),
+            "source_class": row.get("source_class", defaults["source_class"]),
+            "source_id": row.get("source_id", ""),
+            "source_path": row.get("source_path", row.get("transcript_file", "")),
+            "transcript_file": row.get("transcript_file", ""),
+            "turn_index": row.get("turn_index", 0),
+            "timestamp": row.get("timestamp", ""),
+            "git_branch": row.get("git_branch", ""),
+            "chunk_type": row.get("chunk_type", ""),
+            "project_root": row.get("project_root", ""),
+            "distance": None,
+        })
+
+    return _rank_results(mapped, "recency", n)
 
 
 def _parse_timestamp_utc(ts: str) -> Optional[datetime]:

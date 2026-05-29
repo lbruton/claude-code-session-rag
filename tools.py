@@ -159,7 +159,7 @@ def build_search_all_sessions_schema() -> dict:
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Natural language search query",
+                "description": "Natural language search query. Omit (or pass empty) to list the most recent sessions chronologically, newest first.",
             },
             "n": {
                 "type": "integer",
@@ -197,7 +197,7 @@ def build_search_all_sessions_schema() -> dict:
                 "description": "ISO date upper bound, inclusive (e.g., '2026-04-02'). Only returns turns on or before this date.",
             },
         },
-        "required": ["query"],
+        "required": [],
     }
 
 def register_tools(server: Server):
@@ -219,7 +219,7 @@ def register_tools(server: Server):
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Natural language search query (e.g., 'approval workflow decision', 'error in deploy script')",
+                            "description": "Natural language search query (e.g., 'approval workflow decision', 'error in deploy script'). Omit (or pass empty) to list the most recent turns chronologically, newest first.",
                         },
                         "n": {
                             "type": "integer",
@@ -237,7 +237,7 @@ def register_tools(server: Server):
                             "default": "hybrid",
                         },
                     },
-                    "required": ["query"],
+                    "required": [],
                 },
             ),
             types.Tool(
@@ -330,7 +330,7 @@ def register_tools(server: Server):
                 if err:
                     return [err]
                 results = rag_engine.search(
-                    arguments["query"],
+                    arguments.get("query") or "",
                     arguments.get("n", 5),
                     session_id=session_id,
                     project_root=current_project,
@@ -361,7 +361,7 @@ def register_tools(server: Server):
                         return [err]
 
                 results = rag_engine.search(
-                    arguments["query"],
+                    arguments.get("query") or "",
                     arguments.get("n", 10),
                     git_branch=arguments.get("git_branch"),
                     project_root=pr,
