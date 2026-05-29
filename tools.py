@@ -10,7 +10,7 @@ from mcp.server import Server
 from mcp import types
 
 import rag_engine
-from provider_adapters import LEGAL_PROVIDERS, LEGAL_SOURCE_KINDS
+from provider_adapters import LEGAL_PROVIDERS, LEGAL_SORT_BY, LEGAL_SOURCE_KINDS
 
 
 # --- Project context ---
@@ -167,6 +167,12 @@ def build_search_all_sessions_schema() -> dict:
                 "type": "string",
                 "description": "Optional provider source-kind filter (e.g., codex_rollout_jsonl)",
             },
+            "sort_by": {
+                "type": "string",
+                "enum": ["relevance", "recency", "hybrid"],
+                "description": "Ranking strategy: 'relevance' (pure semantic), 'recency' (newest first), or 'hybrid' (blended, default).",
+                "default": "hybrid",
+            },
             "date_from": {
                 "type": "string",
                 "description": "ISO date lower bound, inclusive (e.g., '2026-04-02'). Only returns turns on or after this date.",
@@ -189,8 +195,9 @@ def register_tools(server: Server):
                 name="search_session",
                 description=(
                     "Search conversation history for past discussions, decisions, "
-                    "code snippets, and error messages. Results are boosted by recency "
-                    "so recent conversations rank higher."
+                    "code snippets, and error messages. Ranked by 'hybrid' (blended "
+                    "semantic relevance + recency) by default; pass sort_by to choose "
+                    "'relevance' or 'recency'."
                 ),
                 inputSchema={
                     "type": "object",
@@ -208,6 +215,12 @@ def register_tools(server: Server):
                             "type": "string",
                             "description": "Claude session ID to filter to. Usually auto-resolved; only pass if auto-resolution fails.",
                         },
+                        "sort_by": {
+                            "type": "string",
+                            "enum": ["relevance", "recency", "hybrid"],
+                            "description": "Ranking strategy: 'relevance' (pure semantic), 'recency' (newest first), or 'hybrid' (blended, default).",
+                            "default": "hybrid",
+                        },
                     },
                     "required": ["query"],
                 },
@@ -215,8 +228,10 @@ def register_tools(server: Server):
             types.Tool(
                 name="search_all_sessions",
                 description=(
-                    "Search across ALL past conversation sessions. Pure semantic search "
-                    "without recency bias. Optionally filter by git branch or date range."
+                    "Search across ALL past conversation sessions. Ranked by 'hybrid' "
+                    "(blended semantic relevance + recency) by default; pass sort_by to "
+                    "choose 'relevance' or 'recency'. Optionally filter by git branch or "
+                    "date range."
                 ),
                 inputSchema=build_search_all_sessions_schema(),
             ),
@@ -295,12 +310,19 @@ def register_tools(server: Server):
         try:
             if name == "search_session":
                 session_id = arguments.get("session_id")
+                sort_by_arg = arguments.get("sort_by", "hybrid")
+                if sort_by_arg not in LEGAL_SORT_BY:
+                    allowed = ", ".join(sorted(LEGAL_SORT_BY))
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Invalid sort_by: {sort_by_arg!r}; expected one of: {allowed}",
+                    )]
                 results = rag_engine.search(
                     arguments["query"],
                     arguments.get("n", 5),
                     session_id=session_id,
                     project_root=current_project,
-                    recency_boost=True,
+                    sort_by=sort_by_arg,
                     db_path=db,
                 )
                 return [types.TextContent(type="text", text=format_results(results))]
@@ -317,6 +339,7 @@ def register_tools(server: Server):
 
                 provider_arg = arguments.get("provider")
                 source_kind_arg = arguments.get("source_kind")
+                sort_by_arg = arguments.get("sort_by", "hybrid")
                 if provider_arg is not None and provider_arg not in LEGAL_PROVIDERS:
                     allowed = ", ".join(sorted(LEGAL_PROVIDERS))
                     return [types.TextContent(
@@ -329,13 +352,19 @@ def register_tools(server: Server):
                         type="text",
                         text=f"Invalid source_kind: {source_kind_arg!r}; expected one of: {allowed}",
                     )]
+                if sort_by_arg not in LEGAL_SORT_BY:
+                    allowed = ", ".join(sorted(LEGAL_SORT_BY))
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Invalid sort_by: {sort_by_arg!r}; expected one of: {allowed}",
+                    )]
 
                 results = rag_engine.search(
                     arguments["query"],
                     arguments.get("n", 10),
                     git_branch=arguments.get("git_branch"),
                     project_root=pr,
-                    recency_boost=False,
+                    sort_by=sort_by_arg,
                     date_from=arguments.get("date_from"),
                     date_to=arguments.get("date_to"),
                     provider=arguments.get("provider"),
