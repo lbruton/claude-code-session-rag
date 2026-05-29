@@ -15,7 +15,9 @@ Supports multiple embedding models via SESSIONFLOW_MODEL env var (default: embed
 
 import hashlib
 import json
+import math
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Block all HuggingFace network access at runtime.
@@ -33,12 +35,23 @@ import sys
 import time
 
 from fts_hybrid import FTSIndex, rrf_merge
-from embedding_control import EmbeddingIdentity, get_embedding_budget
+from embedding_control import (
+    EmbeddingIdentity,
+    get_embedding_budget,
+    _env_float,
+    _env_int,
+)
 from provider_adapters import (
     LEGAL_PROVIDERS,
+    LEGAL_SORT_BY,
     LEGAL_SOURCE_KINDS,
     default_provider_metadata,
 )
+
+RECENCY_WEIGHT_DEFAULT = 0.3
+RECENCY_DECAY_DAYS_DEFAULT = 7
+MISSING_TIMESTAMP_RECENCY = 0.5
+_RANKING_SCRATCH_KEYS = ("_rrf_score", "_score", "_semantic_score", "_recency_score")
 
 logger = logging.getLogger("sessionflow.milvus")
 
@@ -659,20 +672,30 @@ def _escape_filter_scalar(value: str) -> str:
 
 def search(query: str, n: int = 5, session_id: Optional[str] = None,
            git_branch: Optional[str] = None, project_root: Optional[str] = None,
-           recency_boost: bool = False,
+           sort_by: str = "hybrid",
            date_from: Optional[str] = None, date_to: Optional[str] = None,
            provider: Optional[str] = None, source_kind: Optional[str] = None,
            db_path: Optional[str] = None) -> List[Dict]:
     """Hybrid search: vector similarity + FTS5 keyword search, merged with RRF.
 
     Both engines run with an expanded candidate pool (n*3), then RRF merges
-    the two ranked lists. Recency boost is applied after merging.
+    the two ranked lists. The merged pool is re-ordered by ``sort_by``:
+    ``relevance`` (pure RRF order), ``recency`` (timestamp-descending re-rank),
+    or ``hybrid`` (blended semantic + recency score; the default).
 
     project_root: when set, restricts results to that project. When None,
     searches across all projects (cross-project search).
     date_from/date_to: ISO 8601 date strings (e.g. '2026-04-02') to restrict
     results to a time range. Timestamps are VARCHAR and sort lexicographically.
     """
+    # Validate sort_by before any embedding/Milvus work (mirrors the
+    # provider/source_kind entry-point validation below).
+    if sort_by not in LEGAL_SORT_BY:
+        allowed = ", ".join(sorted(LEGAL_SORT_BY))
+        raise ValueError(
+            f"Invalid sort_by: {sort_by!r}; expected one of: {allowed}"
+        )
+
     # Validate provider/source_kind before they reach Milvus filter strings.
     # These flow through to a server-side expression as raw quoted values;
     # rejecting unknown inputs early prevents filter-expression injection.
@@ -770,28 +793,25 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
     fts_results = _fts.search(query, n=fetch_n, filters=fts_filters or None, db_path=db_path)
 
     # --- Merge with RRF ---
-    if fts_results and vector_results:
-        # Both engines returned results — merge
-        merged = rrf_merge(vector_results, fts_results, n=fetch_n)
-    elif fts_results:
-        merged = fts_results
-    else:
-        merged = vector_results
+    # Route *every* candidate set through rrf_merge (it handles an empty list
+    # natively and is rank-order-preserving) so each row carries `_rrf_score` —
+    # the only relevance signal that spans both vector and FTS-only rows. The
+    # `_rrf_score` is kept alive until after scoring (see _rank_results).
+    merged = rrf_merge(vector_results, fts_results, n=fetch_n)
 
     if not merged:
         return []
 
-    # Clean up internal RRF score before recency boost
+    # Populate provider/source defaults; do NOT strip `_rrf_score` here — the
+    # strategy dispatcher needs it and strips ranking scratch keys afterwards.
     merge_defaults = default_provider_metadata()
     for r in merged:
-        r.pop("_rrf_score", None)
         r.setdefault("provider", merge_defaults["provider"])
         r.setdefault("source_kind", merge_defaults["source_kind"])
         r.setdefault("source_class", merge_defaults["source_class"])
         r.setdefault("logical_session_id", r.get("session_id", ""))
 
-    if recency_boost and merged:
-        merged = _apply_recency_boost(merged, n)
+    merged = _rank_results(merged, sort_by, n)
 
     # If the FTS table was recently dropped + recreated and backfill hasn't
     # caught up, surface a one-line warning on each row's metadata so callers
@@ -808,63 +828,97 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
     return merged[:n]
 
 
-def _apply_recency_boost(results: List[Dict], n: int) -> List[Dict]:
-    """Re-rank results by combining semantic similarity with recency.
+def _parse_timestamp_utc(ts: str) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp to a UTC-aware datetime.
 
-    Score = similarity * (1 + recency_weight * recency_factor)
-    where recency_factor is 1.0 for the newest result and 0.0 for the oldest.
+    Handles both naive and aware inputs (naive is assumed UTC). Returns None
+    on empty/unparseable input so callers can apply a deterministic fallback.
     """
-    recency_weight = 0.3
+    if not ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
-    # Parse timestamps and sort to find range
-    timestamps = []
-    for r in results:
-        ts = r.get("timestamp", "")
-        if ts:
-            try:
-                # ISO 8601 strings sort lexicographically
-                timestamps.append(ts)
-            except Exception:
-                timestamps.append("")
-        else:
-            timestamps.append("")
 
-    if not any(timestamps):
-        return results
+def _recency_score(ts: str, now: datetime, decay_days: float) -> float:
+    """Age-aware recency in (0, 1]: exp(-days_old / decay_days).
 
-    valid_ts = [t for t in timestamps if t]
-    if len(valid_ts) < 2:
-        return results
+    A result `decay_days` old scores ≈0.367. Missing/unparseable timestamps
+    return a neutral fallback (EARS-8). Future-dated timestamps clamp to
+    days_old=0 so clock skew can't earn an inflated boost.
+    """
+    parsed = _parse_timestamp_utc(ts)
+    if parsed is None:
+        return MISSING_TIMESTAMP_RECENCY
+    days_old = max(0.0, (now - parsed).total_seconds() / 86400.0)
+    return math.exp(-days_old / decay_days)
 
-    ts_min = min(valid_ts)
-    ts_max = max(valid_ts)
 
-    for i, r in enumerate(results):
-        similarity = 1 - r["distance"]  # COSINE distance → similarity
-        ts = timestamps[i]
-        if ts and ts_min != ts_max:
-            # Normalize timestamp to [0, 1] range
-            recency = (valid_ts.index(ts) if ts in valid_ts else 0) / max(len(valid_ts) - 1, 1)
-            # Simple linear approach: newer timestamps get higher recency
-            # Since ISO strings sort ascending, higher position = newer
-            all_sorted = sorted(valid_ts)
-            try:
-                pos = all_sorted.index(ts)
-                recency = pos / max(len(all_sorted) - 1, 1)
-            except ValueError:
-                recency = 0.5
-        else:
-            recency = 0.5
+def _semantic_scores(results: List[Dict]) -> List[float]:
+    """Min-max normalize each row's `_rrf_score` into [0, 1].
 
-        r["_score"] = similarity * (1 + recency_weight * recency)
+    A degenerate pool (single row, or all-equal scores) has a zero range; rather
+    than dividing by zero, every row gets a neutral 1.0.
+    """
+    raw = [r.get("_rrf_score", 0.0) for r in results]
+    if not raw:
+        return []
+    lo, hi = min(raw), max(raw)
+    span = hi - lo
+    if span == 0:
+        return [1.0] * len(raw)
+    return [(s - lo) / span for s in raw]
 
-    results.sort(key=lambda r: r.get("_score", 0), reverse=True)
 
-    # Clean up internal score
-    for r in results:
-        r.pop("_score", None)
+def _rank_results(results: List[Dict], sort_by: str, n: int,
+                  now: Optional[datetime] = None) -> List[Dict]:
+    """Order the merged candidate pool by the chosen strategy, then truncate.
 
-    return results
+    - ``relevance``: keep the post-RRF order (no recency re-rank).
+    - ``recency``: re-rank by timestamp descending; missing-timestamp rows last.
+    - ``hybrid``: final = (1-w)*semantic_score + w*recency_score.
+
+    Strips ranking scratch keys (`_rrf_score`, `_score`, `_semantic_score`,
+    `_recency_score`) before returning — but preserves non-score engine metadata
+    such as `_fts_warning`.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    if sort_by == "relevance":
+        ranked = list(results)
+    elif sort_by == "recency":
+        _epoch = datetime.min.replace(tzinfo=timezone.utc)
+        ranked = sorted(
+            results,
+            key=lambda r: _parse_timestamp_utc(r.get("timestamp", "")) or _epoch,
+            reverse=True,
+        )
+    else:  # hybrid
+        weight = _env_float(
+            "SESSIONFLOW_RECENCY_WEIGHT", RECENCY_WEIGHT_DEFAULT, 0.0, 1.0
+        )
+        decay_days = _env_int(
+            "SESSIONFLOW_RECENCY_DECAY_DAYS", RECENCY_DECAY_DAYS_DEFAULT, minimum=1
+        )
+        semantic = _semantic_scores(results)
+        for r, sem in zip(results, semantic):
+            rec = _recency_score(r.get("timestamp", ""), now, decay_days)
+            r["_semantic_score"] = sem
+            r["_recency_score"] = rec
+            r["_score"] = (1 - weight) * sem + weight * rec
+        ranked = sorted(results, key=lambda r: r.get("_score", 0.0), reverse=True)
+
+    for r in ranked:
+        for key in _RANKING_SCRATCH_KEYS:
+            r.pop(key, None)
+
+    return ranked[:n]
 
 
 def get_turns(session_id: str, turn_index: int, context: int = 2,
@@ -1257,7 +1311,7 @@ def list_sessions(project_root: Optional[str] = None,
 
 async def search_async(query: str, n: int = 5, session_id: Optional[str] = None,
                        git_branch: Optional[str] = None, project_root: Optional[str] = None,
-                       recency_boost: bool = False,
+                       sort_by: str = "hybrid",
                        provider: Optional[str] = None, source_kind: Optional[str] = None,
                        db_path: Optional[str] = None) -> List[Dict]:
     """Async search with embed semaphore."""
@@ -1279,7 +1333,7 @@ async def search_async(query: str, n: int = 5, session_id: Optional[str] = None,
             executor,
             lambda: search(
                 query, n, session_id=session_id, git_branch=git_branch,
-                project_root=project_root, recency_boost=recency_boost,
+                project_root=project_root, sort_by=sort_by,
                 provider=provider, source_kind=source_kind, db_path=db_path,
             ),
         )
