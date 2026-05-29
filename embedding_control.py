@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
+import math
 import os
 import time
 from typing import Optional
@@ -30,6 +31,36 @@ def _env_int(name: str, default: int, minimum: Optional[int] = None) -> int:
         value = default
     if minimum is not None:
         value = max(value, minimum)
+    return value
+
+
+def _env_float(
+    name: str,
+    default: float,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
+    """Read a float env var, falling back to ``default`` on bad input.
+
+    Unlike ``_env_int`` (which clamps to ``minimum``), an unparseable value OR a
+    value outside ``[minimum, maximum]`` returns ``default`` rather than clamping.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    # NaN/Inf parse cleanly via float() but slip past the bounds checks below
+    # (every NaN comparison is False), so reject non-finite values explicitly —
+    # NaN would otherwise propagate into hybrid scores and corrupt sort order.
+    if not math.isfinite(value):
+        return default
+    if minimum is not None and value < minimum:
+        return default
+    if maximum is not None and value > maximum:
+        return default
     return value
 
 
