@@ -675,6 +675,37 @@ def _escape_filter_scalar(value: str) -> str:
     return value.replace('"', '""')
 
 
+def _row_to_result(entity: Dict, defaults: Dict, distance: float = 1.0) -> Dict:
+    """Map a Milvus entity dict to the standard internal result format.
+
+    Shared by ``search`` (vector hit entities) and ``_recent_listing`` (query
+    result rows) so any new schema field added to the collection propagates to
+    both code paths automatically.
+
+    ``distance`` is the COSINE distance from the query vector. Use the default
+    ``1.0`` sentinel for query-less listings where no similarity score exists
+    (1.0 distance → 0.0 similarity, which is the honest value).
+    """
+    return {
+        "content": entity.get("document", ""),
+        "doc_id": entity.get("doc_id", ""),
+        "session_id": entity.get("session_id", ""),
+        "logical_session_id": entity.get("logical_session_id", entity.get("session_id", "")),
+        "provider": entity.get("provider", defaults["provider"]),
+        "source_kind": entity.get("source_kind", defaults["source_kind"]),
+        "source_class": entity.get("source_class", defaults["source_class"]),
+        "source_id": entity.get("source_id", ""),
+        "source_path": entity.get("source_path", entity.get("transcript_file", "")),
+        "transcript_file": entity.get("transcript_file", ""),
+        "turn_index": entity.get("turn_index", 0),
+        "timestamp": entity.get("timestamp", ""),
+        "git_branch": entity.get("git_branch", ""),
+        "chunk_type": entity.get("chunk_type", ""),
+        "project_root": entity.get("project_root", ""),
+        "distance": distance,
+    }
+
+
 def _build_milvus_filter(session_id: Optional[str], git_branch: Optional[str],
                          project_root: Optional[str], provider: Optional[str],
                          source_kind: Optional[str], date_from: Optional[str],
@@ -697,13 +728,17 @@ def _build_milvus_filter(session_id: Optional[str], git_branch: Optional[str],
     if source_kind:
         filters.append(f'source_kind == "{source_kind}"')
     if date_from:
-        filters.append(f'timestamp >= "{date_from}"')
+        filters.append(f'timestamp >= "{_escape_filter_scalar(date_from)}"')
     if date_to:
-        filters.append(f'timestamp <= "{date_to}T23:59:59"')
+        # Strip any existing time component before appending T23:59:59 so the
+        # ISO string is always well-formed even if the caller passed a full
+        # datetime string.
+        date_to_date = date_to.split("T")[0]
+        filters.append(f'timestamp <= "{_escape_filter_scalar(date_to_date)}T23:59:59"')
     return " && ".join(filters) if filters else None
 
 
-def search(query: str, n: int = 5, session_id: Optional[str] = None,
+def search(query: Optional[str], n: int = 5, session_id: Optional[str] = None,
            git_branch: Optional[str] = None, project_root: Optional[str] = None,
            sort_by: str = "hybrid",
            date_from: Optional[str] = None, date_to: Optional[str] = None,
@@ -787,25 +822,9 @@ def search(query: str, n: int = 5, session_id: Optional[str] = None,
     vector_results = []
     if results and results[0]:
         for hit in results[0]:
-            entity = hit["entity"]
-            vector_results.append({
-                "content": entity["document"],
-                "doc_id": entity.get("doc_id", ""),
-                "session_id": entity.get("session_id", ""),
-                "logical_session_id": entity.get("logical_session_id", entity.get("session_id", "")),
-                "provider": entity.get("provider", provider_defaults["provider"]),
-                "source_kind": entity.get("source_kind", provider_defaults["source_kind"]),
-                "source_class": entity.get("source_class", provider_defaults["source_class"]),
-                "source_id": entity.get("source_id", ""),
-                "source_path": entity.get("source_path", entity.get("transcript_file", "")),
-                "transcript_file": entity.get("transcript_file", ""),
-                "turn_index": entity.get("turn_index", 0),
-                "timestamp": entity.get("timestamp", ""),
-                "git_branch": entity.get("git_branch", ""),
-                "chunk_type": entity.get("chunk_type", ""),
-                "project_root": entity.get("project_root", ""),
-                "distance": hit["distance"],
-            })
+            vector_results.append(
+                _row_to_result(hit["entity"], provider_defaults, distance=hit["distance"])
+            )
 
     # --- FTS5 keyword search ---
     fts_filters = {}
@@ -897,26 +916,10 @@ def _recent_listing(n: int, session_id: Optional[str] = None,
         return []
 
     defaults = default_provider_metadata()
-    mapped = []
-    for row in rows:
-        mapped.append({
-            "content": row.get("document", ""),
-            "doc_id": row.get("doc_id", ""),
-            "session_id": row.get("session_id", ""),
-            "logical_session_id": row.get("logical_session_id", row.get("session_id", "")),
-            "provider": row.get("provider", defaults["provider"]),
-            "source_kind": row.get("source_kind", defaults["source_kind"]),
-            "source_class": row.get("source_class", defaults["source_class"]),
-            "source_id": row.get("source_id", ""),
-            "source_path": row.get("source_path", row.get("transcript_file", "")),
-            "transcript_file": row.get("transcript_file", ""),
-            "turn_index": row.get("turn_index", 0),
-            "timestamp": row.get("timestamp", ""),
-            "git_branch": row.get("git_branch", ""),
-            "chunk_type": row.get("chunk_type", ""),
-            "project_root": row.get("project_root", ""),
-            "distance": None,
-        })
+    # distance=1.0 sentinel: no query vector exists for recency listings, so
+    # 1.0 (maximum COSINE distance → 0 similarity) is the honest placeholder
+    # and prevents the 1 - None TypeError in format_results.
+    mapped = [_row_to_result(row, defaults, distance=1.0) for row in rows]
 
     return _rank_results(mapped, "recency", n)
 
