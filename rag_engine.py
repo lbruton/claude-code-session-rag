@@ -782,7 +782,7 @@ def search(query: Optional[str], n: int = 5, session_id: Optional[str] = None,
     # match and nothing for FTS, so fall back to a filter-only chronological
     # listing regardless of sort_by. Branches before embed_texts so an empty
     # string never produces a degenerate query vector.
-    if not (query or "").strip():
+    if not query or not query.strip():
         return _recent_listing(
             n, session_id=session_id, git_branch=git_branch,
             project_root=project_root, provider=provider,
