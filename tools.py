@@ -159,7 +159,7 @@ def build_search_all_sessions_schema() -> dict:
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Natural language search query. Omit (or pass empty) to list the most recent sessions chronologically, newest first.",
+                "description": "Natural language search query. Omit (or pass empty) to list the most recent turns chronologically, newest first.",
             },
             "n": {
                 "type": "integer",
