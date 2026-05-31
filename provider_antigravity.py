@@ -200,8 +200,8 @@ class AntigravityAdapter:
         # Desktop history.jsonl is empty; consult the summaries metadata as a
         # second resolution layer (SESF-17). Gated to the desktop variant so the
         # CLI path is provably untouched (AC-6). Parsed once per discovery pass,
-        # mirroring _load_history(). Stub loader returns {} until Cohort C, so
-        # desktop project_root still resolves to "unknown" here.
+        # mirroring _load_history(). The loader parses the summaries .pb, so a
+        # desktop source's project_root resolves history -> summaries -> "unknown".
         summaries: Dict[str, str] = {}
         if self.variant == "desktop":
             summaries = _load_summaries(self.root)
