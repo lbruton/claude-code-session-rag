@@ -1,10 +1,9 @@
-# Docstring lint for SessionFlow. Enforces the "Documentation Standards" from
-# DocVault steering (specflow/SessionFlow/steering/structure.md):
+# Docstring lint for SessionFlow. Enforces docstring presence on the public API:
 #   - module docstring on every file
 #   - public functions/classes documented (Google-style)
 #   - private symbols (leading underscore) exempt unless the name is unclear
 # pydocstyle's D-rules only flag public (non-underscore) names by design, so the
-# private-symbol exemption is honored automatically. Run `ruff check .` pre-PR.
+# private-symbol exemption is honored automatically. See CLAUDE.md "Code Style".
 target-version = "py313"
 extend-exclude = [".claude"]   # venv/__pycache__ are already in ruff's default excludes
 
