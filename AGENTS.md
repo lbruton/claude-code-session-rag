@@ -37,6 +37,10 @@ Semantic search over agent session transcripts. Independent project, originally 
 - **FTS5 thread affinity (SESF-13)** — `FTSIndex` keeps per-thread persistent connections (`threading.local`). Server-mode connections opened on the embed executor and request threads are isolated, and cross-thread `close_all()` is a no-op rather than a noisy WARN.
 - **OpenCode timestamps (SESF-14)** — `provider_adapters.normalize_timestamp()` coerces int-ms epochs (and any other numeric/datetime input) to ISO-8601 strings before they hit Milvus's `VARCHAR(64)` timestamp field. All four provider adapters route timestamps through it.
 
+## Code Style
+
+See CLAUDE.md "Code Style" for the docstring policy and the pre-PR `ruff` gate (`ruff.toml`).
+
 ## Issue Tracking
 
 Issues use the `SESF-` prefix and are tracked in Plane: <https://plane.lbruton.cc/lbruton/projects/3835ead1-4cc4-4f89-8145-4923068f7403/>.

@@ -37,6 +37,20 @@ Semantic search over Claude Code session transcripts. Independent project, origi
 - **FTS5 thread affinity (SESF-13)** — `FTSIndex` keeps per-thread persistent connections (`threading.local`). Server-mode connections opened on the embed executor and request threads are isolated, and cross-thread `close_all()` is a no-op rather than a noisy WARN.
 - **OpenCode timestamps (SESF-14)** — `provider_adapters.normalize_timestamp()` coerces int-ms epochs (and any other numeric/datetime input) to ISO-8601 strings before they hit Milvus's `VARCHAR(64)` timestamp field. All four provider adapters route timestamps through it.
 
+## Code Style
+
+Docstring policy (enforced by `ruff`; config in `ruff.toml`, `D1` rules, Google convention, public API only):
+
+- Module docstring on every file.
+- Public functions, classes, and methods: Google-style — args, returns, non-obvious behavior.
+- Private symbols (leading `_`): only when the name isn't self-explanatory.
+
+Pre-PR:
+
+- `pip install -r requirements-dev.txt`.
+- Run `ruff check` on the `.py` files you changed.
+- A bare `ruff check .` reports the SESF-31 backlog (~92 existing gaps) until that issue clears; afterward it is the standing guard.
+
 ## Issue Tracking
 
 Issues use the `SESF-` prefix and are tracked in Plane: <https://plane.lbruton.cc/lbruton/projects/3835ead1-4cc4-4f89-8145-4923068f7403/>.
