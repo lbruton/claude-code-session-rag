@@ -6,7 +6,7 @@
 # pydocstyle's D-rules only flag public (non-underscore) names by design, so the
 # private-symbol exemption is honored automatically. Run `ruff check .` pre-PR.
 target-version = "py313"
-extend-exclude = [".claude", "venv", "__pycache__"]
+extend-exclude = [".claude"]   # venv/__pycache__ are already in ruff's default excludes
 
 [lint]
 # D1xx = "missing docstring" rules (D100-D107). This is a COVERAGE gate, matching

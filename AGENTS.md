@@ -40,7 +40,7 @@ Semantic search over agent session transcripts. Independent project, originally 
 ## Code Style
 
 - **Docstrings** — follow the steering "Documentation Standards" (`DocVault/specflow/SessionFlow/steering/structure.md`): a module docstring on every file; public functions, classes, and methods documented Google-style (args, returns, non-obvious behavior); private symbols (leading `_`) only when the name isn't self-explanatory.
-- **Pre-PR gate** — `pip install -r requirements-dev.txt` then `ruff check .` (config in `ruff.toml`). It enforces docstring *presence* on public API only (`D1` rules, Google convention); it does not touch style or private symbols. New public symbols without a docstring fail the check.
+- **Pre-PR gate** — `pip install -r requirements-dev.txt`, then run `ruff check <the .py files you changed>` to confirm new public symbols are documented (`D1` rules, Google convention; style and private symbols untouched). A bare `ruff check .` currently reports the SESF-31 backlog (~92 existing gaps), so scope it to the files you touched until that issue clears; afterward, plain `ruff check .` is the standing guard. Config in `ruff.toml`.
 
 ## Issue Tracking
 
