@@ -281,3 +281,49 @@ def test_desktop_summaries_skips_non_length_delimited_wire_types(
     roots = _desktop_project_roots(fixture)
 
     assert roots[fixture["mixed_wire_id"]] == fixture["mixed_wire_ws"]
+
+
+def test_desktop_summaries_isolates_single_malformed_record():
+    """Per-record fault isolation (SESF-29 review): a single corrupt record inside
+    an otherwise-valid .pb is skipped, not allowed to discard every other mapping.
+
+    The malformed record's outer (top-level Field 1) frame is well-formed, so the
+    top-level walker still hands its payload to _decode_record; the *inner* bytes
+    claim a length-delimited field longer than the buffer, raising IndexError. With
+    fault isolation that record is dropped and the two valid records still resolve;
+    without it, _iter_length_delimited's error would bubble to _load_summaries and
+    zero out the whole file.
+    """
+    import provider_antigravity
+
+    def _varint(value):
+        out = bytearray()
+        while True:
+            byte = value & 0x7F
+            value >>= 7
+            if value:
+                out.append(byte | 0x80)
+            else:
+                out.append(byte)
+                return bytes(out)
+
+    def _ld(tag, payload):  # length-delimited (wire type 2) field
+        return bytes([tag]) + _varint(len(payload)) + payload
+
+    def _record(conversation_id, uri):  # inner body: F1=uuid, F2->9->1=uri
+        nested = _ld(0x0A, uri.encode("utf-8"))
+        return _ld(0x0A, conversation_id.encode("utf-8")) + _ld(0x12, _ld(0x4A, nested))
+
+    def _wrap(record):  # top-level Field 1 frame
+        return _ld(0x0A, record)
+
+    good_a_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    good_b_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    good_a = _wrap(_record(good_a_id, "file:///tmp/a"))
+    good_b = _wrap(_record(good_b_id, "file:///tmp/b"))
+    # Inner Field 1 (wt=2) declares a 50-byte payload but only 3 bytes follow.
+    malformed = _wrap(bytes([0x0A]) + _varint(50) + b"abc")
+
+    mapping = provider_antigravity._walk_length_delimited(good_a + malformed + good_b)
+
+    assert mapping == {good_a_id: "file:///tmp/a", good_b_id: "file:///tmp/b"}
