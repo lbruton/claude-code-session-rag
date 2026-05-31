@@ -207,6 +207,127 @@ def synthetic_antigravity_home(tmp_path):
     return home
 
 
+def _pb_varint(value: int) -> bytes:
+    """Encode a non-negative int as a protobuf base-128 varint."""
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def _pb_len_delimited(tag: int, payload: bytes) -> bytes:
+    """Frame `payload` as a wire-type-2 (length-delimited) field with `tag`."""
+    return bytes([tag]) + _pb_varint(len(payload)) + payload
+
+
+def _pb_summaries_record(conversation_id: str, workspace_uri: str) -> bytes:
+    """
+    Build one top-level summaries record mapping a conversation to a workspace URI.
+
+    Wire layout (all wire type 2, length-delimited):
+        Field 1 (0x0A) -> conversation UUID string
+        Field 2 (0x12) -> submessage:
+            Field 9 (0x4A) -> nested submessage:
+                Field 1 (0x0A) -> workspace `file://` URI string
+    """
+    nested = _pb_len_delimited(0x0A, workspace_uri.encode("utf-8"))  # Field 1 (URI)
+    field9 = _pb_len_delimited(0x4A, nested)                          # Field 9 (nested submessage)
+    field2 = _pb_len_delimited(0x12, field9)                          # Field 2 (submessage)
+    field1 = _pb_len_delimited(0x0A, conversation_id.encode("utf-8"))  # Field 1 (conversation UUID)
+    return field1 + field2
+
+
+@pytest.fixture
+def synthetic_antigravity_desktop_home(tmp_path):
+    """
+    Materialize a synthetic Antigravity *desktop* root for SESF-17 project-detection tests.
+
+    Layout (under `<tmp>/home/.gemini/antigravity/`):
+      - `brain/<uuid>/.system_generated/logs/transcript.jsonl` for four conversations.
+      - A hand-built valid `agyhub_summaries_proto.pb` mapping a subset of those
+        conversation_ids to `file://` workspace URIs via the Field 1 / Field 2->9->1
+        wire structure.
+      - One conversation present in `brain/` but absent from the `.pb` (AC-4 -> "unknown").
+      - One record carrying a percent-encoded `file://` path (`%20` space + a unicode
+        char) to exercise AC-2's `urllib.parse.unquote` decode branch.
+      - A separately-addressable malformed/truncated `.pb` variant (`*.truncated`) — a
+        short read of the valid bytes — for AC-5.
+
+    Self-contained: does not read the live `~/.gemini` tree.
+
+    Returns a dict:
+      - `home`             pathlib.Path to the synthetic home (pass as `home=` to the adapter).
+      - `root`             pathlib.Path to `.../.gemini/antigravity`.
+      - `pb_path`          pathlib.Path to the valid `agyhub_summaries_proto.pb`.
+      - `truncated_pb_path` pathlib.Path to the malformed/truncated `.pb` variant.
+      - `mapped`           {conversation_id: decoded_workspace_path} for `.pb`-mapped convs.
+      - `unmapped`         list of conversation_ids present in brain but absent from `.pb`.
+      - `encoded_id`       conversation_id of the percent-encoded record.
+      - `encoded_decoded`  the expected decoded filesystem path for `encoded_id`.
+    """
+    home = tmp_path / "home"
+    root = home / ".gemini" / "antigravity"
+
+    # Conversation ids (brain dir names). The first three are mapped in the `.pb`;
+    # the fourth is intentionally absent from the `.pb` to exercise AC-4.
+    plain_id = "11111111-1111-1111-1111-111111111111"
+    plain_ws = "/Volumes/DATA/GitHub/SessionFlow"
+    second_id = "22222222-2222-2222-2222-222222222222"
+    second_ws = "/Users/lbruton/Projects/Demo"
+    encoded_id = "33333333-3333-3333-3333-333333333333"
+    # Percent-encoded path: a literal space (%20) and a unicode char (café -> caf%C3%A9).
+    encoded_decoded = "/Users/lbruton/My Projects/café"
+    encoded_ws = "/Users/lbruton/My%20Projects/caf%C3%A9"
+    unmapped_id = "44444444-4444-4444-4444-444444444444"
+
+    brain_ids = [plain_id, second_id, encoded_id, unmapped_id]
+    for conversation_id in brain_ids:
+        logs = root / "brain" / conversation_id / ".system_generated" / "logs"
+        logs.mkdir(parents=True)
+        (logs / "transcript.jsonl").write_text("\n".join([
+            json.dumps({"step_index": 1, "type": "USER_INPUT", "text": "synthetic desktop ask"}),
+            json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "text": "synthetic desktop plan"}),
+        ]) + "\n")
+
+    # Hand-built valid `.pb`: three top-level records (plain, second, percent-encoded).
+    # The `file://` URIs carry the scheme prefix; AC-2's normalizer strips it and
+    # `unquote`s the percent-encoded record back to `encoded_decoded`.
+    pb_bytes = b"".join([
+        _pb_summaries_record(plain_id, "file://" + plain_ws),
+        _pb_summaries_record(second_id, "file://" + second_ws),
+        _pb_summaries_record(encoded_id, "file://" + encoded_ws),
+    ])
+    pb_path = root / "agyhub_summaries_proto.pb"
+    pb_path.write_bytes(pb_bytes)
+
+    # Malformed/truncated variant: a short read of the valid bytes, slicing through
+    # the middle of a length-delimited field so the walker hits a boundary error.
+    truncated_pb_path = root / "agyhub_summaries_proto.pb.truncated"
+    truncated_pb_path.write_bytes(pb_bytes[: len(pb_bytes) // 2])
+
+    mapped = {
+        plain_id: plain_ws,
+        second_id: second_ws,
+        encoded_id: encoded_decoded,
+    }
+
+    return {
+        "home": home,
+        "root": root,
+        "pb_path": pb_path,
+        "truncated_pb_path": truncated_pb_path,
+        "mapped": mapped,
+        "unmapped": [unmapped_id],
+        "encoded_id": encoded_id,
+        "encoded_decoded": encoded_decoded,
+    }
+
+
 @pytest.fixture
 def stub_rag_engine(monkeypatch):
     """Stub the heavy rag_engine import for tests that inspect CLI/server formatting."""
