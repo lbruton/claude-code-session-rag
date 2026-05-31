@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 import hashlib
 import json
@@ -42,13 +42,21 @@ def _read_varint(data: bytes, pos: int) -> Tuple[int, int]:
     raise ValueError("varint exceeds 10 bytes (truncated or malformed stream)")
 
 
-def _iter_length_delimited(data: bytes):
+def _iter_length_delimited(data: bytes) -> Iterator[Tuple[int, bytes]]:
     """Yield ``(field_number, payload)`` for every wire-type-2 field in ``data``.
 
-    Tolerant of trailing/non-length-delimited fields: a tag whose wire type is
-    not 2 (length-delimited) raises ``ValueError`` (unexpected framing) so the
-    caller can degrade to ``"unknown"`` rather than mis-decode. ``IndexError``
-    from a short read also propagates up to the defensive loader (AC-5).
+    Non-length-delimited fields are silently skipped by advancing ``pos`` by the
+    correct byte count for each wire type:
+    - wt=0 (varint): consume a varint (reuse ``_read_varint``) and discard.
+    - wt=1 (fixed64): advance ``pos`` by 8 bytes.
+    - wt=2 (length-delimited): read length prefix, yield ``(field_number, payload)``.
+    - wt=5 (fixed32): advance ``pos`` by 4 bytes.
+    - wt=3/4 (deprecated group start/end): raises ``ValueError`` — these are
+      obsolete and never appear in real Antigravity data; the defensive loader in
+      ``_load_summaries`` catches this and returns ``{}`` (AC-5).
+
+    ``IndexError`` from a short read propagates up to ``_load_summaries`` for
+    graceful degradation to ``"unknown"`` (AC-5).
     """
     pos = 0
     length = len(data)
@@ -56,14 +64,25 @@ def _iter_length_delimited(data: bytes):
         tag, pos = _read_varint(data, pos)
         field_number = tag >> 3
         wire_type = tag & 0x07
-        if wire_type != 2:
+        if wire_type == 0:
+            # Varint field — consume and discard.
+            _, pos = _read_varint(data, pos)
+        elif wire_type == 1:
+            # 64-bit fixed field — skip 8 bytes.
+            pos += 8
+        elif wire_type == 2:
+            # Length-delimited — yield payload to caller.
+            size, pos = _read_varint(data, pos)
+            end = pos + size
+            if end > length:
+                raise IndexError("length-delimited payload runs past end of buffer")
+            yield field_number, data[pos:end]
+            pos = end
+        elif wire_type == 5:
+            # 32-bit fixed field — skip 4 bytes.
+            pos += 4
+        else:
             raise ValueError(f"unsupported wire type {wire_type} for field {field_number}")
-        size, pos = _read_varint(data, pos)
-        end = pos + size
-        if end > length:
-            raise IndexError("length-delimited payload runs past end of buffer")
-        yield field_number, data[pos:end]
-        pos = end
 
 
 def _walk_length_delimited(data: bytes) -> Dict[str, str]:
@@ -71,24 +90,40 @@ def _walk_length_delimited(data: bytes) -> Dict[str, str]:
 
     Schema-free varint / length-delimited walker (stdlib only, D-1). Iterates
     the **top-level** length-delimited records (a flat sequence, not a single
-    wrapper-with-repeated-field, D-2): a Field 1 carries a conversation UUID and
-    the following Field 2 carries the workspace submessage, decoded recursively
-    via the nested Field 2->9->1 path. Returns a ``{conversation_id: workspace_uri}``
-    map. Tolerates ``UnicodeDecodeError`` while decoding individual strings.
+    wrapper-with-repeated-field, D-2): Field 1 carries a conversation UUID and
+    Field 2 carries the workspace submessage, decoded recursively via the nested
+    Field 2->9->1 path.
+
+    Field-order independent: protobuf does not guarantee that Field 1 precedes
+    Field 2 within a record. The walker maintains two one-slot queues: one for
+    orphaned Field-1 IDs (arrived without a matching Field-2 yet) and one for
+    orphaned Field-2 URIs (arrived without a matching Field-1 yet). Whenever
+    both queues are non-empty they are paired and emitted immediately, regardless
+    of which arrived first.
+
+    Returns a ``{conversation_id: workspace_uri}`` map. Tolerates
+    ``UnicodeDecodeError`` while decoding individual strings.
     """
     mapping: Dict[str, str] = {}
+    # One-slot pending queues.  An entry is consumed the moment its partner arrives.
     pending_id: Optional[str] = None
+    pending_uri: Optional[str] = None
+
     for field_number, payload in _iter_length_delimited(data):
         if field_number == 1:
             try:
                 pending_id = payload.decode("utf-8")
             except UnicodeDecodeError:
                 pending_id = None
-        elif field_number == 2 and pending_id is not None:
-            uri = _extract_workspace_uri(payload)
-            if uri is not None:
-                mapping[pending_id] = uri
+        elif field_number == 2:
+            pending_uri = _extract_workspace_uri(payload)
+
+        # Emit as soon as both slots are filled — handles any arrival order.
+        if pending_id is not None and pending_uri is not None:
+            mapping[pending_id] = pending_uri
             pending_id = None
+            pending_uri = None
+
     return mapping
 
 

@@ -1,12 +1,23 @@
-"""SESF-6 red-phase tests for Antigravity JSONL transcript ingestion.
+"""Tests for Antigravity JSONL transcript ingestion (SESF-6) and desktop
+summaries-based project_root resolution (SESF-17).
 
-Requirements: 1, 4, 5, 8.
+The SESF-6 section covers CLI adapter wiring, history.jsonl workspace mapping,
+and the protobuf-support health baseline.
 
-SESF-17 (B.1) adds desktop summaries-based project_root resolution tests
-below (AC-1..AC-8), all driven by the synthetic_antigravity_desktop_home
-fixture. These are RED-phase: the A.2 helper stubs (_walk_length_delimited,
-_normalize_file_uri, _load_summaries) are no-ops, so the AC-1/AC-2/AC-3
-(summaries-wins)/AC-5(real-parse) assertions fail until Cohort C lands.
+The SESF-17 section (AC-1..AC-8) verifies desktop summaries project_root
+resolution via the implemented helpers (_read_varint, _iter_length_delimited,
+_walk_length_delimited, _normalize_file_uri, _load_summaries). All helpers are
+fully implemented and the suite is green. Tests cover:
+  AC-1: .pb-mapped conversation resolves to workspace path.
+  AC-2: percent-encoded file:// URI (urlparse+unquote) decodes correctly.
+  AC-3: history.jsonl wins over summaries; summaries wins when history absent.
+  AC-4: unmapped conversation resolves to "unknown".
+  AC-5: absent/truncated/unreadable/decode-error .pb degrades gracefully (no raise).
+  AC-6: CLI variant never consults summaries.
+  AC-7: project_root is a str path; no project-name field; junk -> "unknown".
+  AC-8: desktop health limitations reflect parsed summaries; CLI keeps baseline.
+Additionally: wire-type robustness — records with interleaved wt=0/1/5 fields
+and reversed field order (Field 2 before Field 1) still resolve correctly.
 """
 
 import dataclasses
@@ -253,3 +264,20 @@ def test_cli_health_keeps_baseline_protobuf_string_ac8(synthetic_antigravity_hom
 
     assert health.provider == "antigravity_cli"
     assert "Protobuf/database artifacts are not parsed in SESF-6." in health.limitations
+
+
+def test_desktop_summaries_skips_non_length_delimited_wire_types(
+    synthetic_antigravity_desktop_home,
+):
+    """Wire-type robustness: a record that embeds wt=0/1/5 fields and reversed field order
+    must still resolve to its workspace path.
+
+    Before Fix 1+2, _iter_length_delimited raises ValueError on the first wt!=2 tag, which
+    causes _load_summaries to return {} and the conversation resolves to "unknown".
+    After the fix, the walker skips wt=0/1/5 fields and _walk_length_delimited collects
+    both Field 1 and Field 2 regardless of arrival order, so the workspace path resolves.
+    """
+    fixture = synthetic_antigravity_desktop_home
+    roots = _desktop_project_roots(fixture)
+
+    assert roots[fixture["mixed_wire_id"]] == fixture["mixed_wire_ws"]
