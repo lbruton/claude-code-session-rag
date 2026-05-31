@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
+from urllib.parse import unquote, urlparse
 import hashlib
 import json
 
@@ -17,6 +18,176 @@ from provider_adapters import (
     canonicalize_path,
     normalize_timestamp,
 )
+
+
+_VARINT_MAX_BYTES = 10  # max bytes for a 64-bit base-128 varint (D-1).
+
+
+def _read_varint(data: bytes, pos: int) -> Tuple[int, int]:
+    """Read a base-128 varint from ``data`` at ``pos``.
+
+    Returns ``(value, next_pos)``. Caps the varint at 10 bytes (the max for a
+    64-bit value) and raises ``ValueError`` past that so a malformed/truncated
+    stream can't spin in an infinite loop (D-1). Raises ``IndexError`` on a
+    short read past the end of the buffer.
+    """
+    value = 0
+    shift = 0
+    for read in range(_VARINT_MAX_BYTES):
+        byte = data[pos + read]
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos + read + 1
+        shift += 7
+    raise ValueError("varint exceeds 10 bytes (truncated or malformed stream)")
+
+
+def _iter_length_delimited(data: bytes) -> Iterator[Tuple[int, bytes]]:
+    """Yield ``(field_number, payload)`` for every wire-type-2 field in ``data``.
+
+    Non-length-delimited fields are silently skipped by advancing ``pos`` by the
+    correct byte count for each wire type:
+    - wt=0 (varint): consume a varint (reuse ``_read_varint``) and discard.
+    - wt=1 (fixed64): advance ``pos`` by 8 bytes.
+    - wt=2 (length-delimited): read length prefix, yield ``(field_number, payload)``.
+    - wt=5 (fixed32): advance ``pos`` by 4 bytes.
+    - wt=3/4 (deprecated group start/end): raises ``ValueError`` — these are
+      obsolete and never appear in real Antigravity data; the defensive loader in
+      ``_load_summaries`` catches this and returns ``{}`` (AC-5).
+
+    ``IndexError`` from a short read propagates up to ``_load_summaries`` for
+    graceful degradation to ``"unknown"`` (AC-5).
+    """
+    pos = 0
+    length = len(data)
+    while pos < length:
+        tag, pos = _read_varint(data, pos)
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if wire_type == 0:
+            # Varint field — consume and discard.
+            _, pos = _read_varint(data, pos)
+        elif wire_type == 1:
+            # 64-bit fixed field — skip 8 bytes.
+            pos += 8
+        elif wire_type == 2:
+            # Length-delimited — yield payload to caller.
+            size, pos = _read_varint(data, pos)
+            end = pos + size
+            if end > length:
+                raise IndexError("length-delimited payload runs past end of buffer")
+            yield field_number, data[pos:end]
+            pos = end
+        elif wire_type == 5:
+            # 32-bit fixed field — skip 4 bytes.
+            pos += 4
+        else:
+            raise ValueError(f"unsupported wire type {wire_type} for field {field_number}")
+
+
+def _walk_length_delimited(data: bytes) -> Dict[str, str]:
+    """Decode the Antigravity ``agyhub_summaries_proto.pb`` wire format.
+
+    Schema-free varint / length-delimited walker (stdlib only, D-1). Iterates
+    the **top-level** length-delimited records (a flat sequence, not a single
+    wrapper-with-repeated-field, D-2): Field 1 carries a conversation UUID and
+    Field 2 carries the workspace submessage, decoded recursively via the nested
+    Field 2->9->1 path.
+
+    Field-order independent: protobuf does not guarantee that Field 1 precedes
+    Field 2 within a record. The walker maintains two one-slot queues: one for
+    orphaned Field-1 IDs (arrived without a matching Field-2 yet) and one for
+    orphaned Field-2 URIs (arrived without a matching Field-1 yet). Whenever
+    both queues are non-empty they are paired and emitted immediately, regardless
+    of which arrived first.
+
+    Returns a ``{conversation_id: workspace_uri}`` map. Tolerates
+    ``UnicodeDecodeError`` while decoding individual strings.
+    """
+    mapping: Dict[str, str] = {}
+    # One-slot pending queues.  An entry is consumed the moment its partner arrives.
+    pending_id: Optional[str] = None
+    pending_uri: Optional[str] = None
+
+    for field_number, payload in _iter_length_delimited(data):
+        if field_number == 1:
+            try:
+                pending_id = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                pending_id = None
+        elif field_number == 2:
+            pending_uri = _extract_workspace_uri(payload)
+
+        # Emit as soon as both slots are filled — handles any arrival order.
+        if pending_id is not None and pending_uri is not None:
+            mapping[pending_id] = pending_uri
+            pending_id = None
+            pending_uri = None
+
+    return mapping
+
+
+def _extract_workspace_uri(field2: bytes) -> Optional[str]:
+    """Decode the nested Field 2->9->1 submessage path to a workspace URI string.
+
+    Returns the decoded URI, or ``None`` if the expected nesting is absent or a
+    string fails to decode as UTF-8.
+    """
+    for field_number, payload in _iter_length_delimited(field2):
+        if field_number != 9:
+            continue
+        for inner_number, inner_payload in _iter_length_delimited(payload):
+            if inner_number != 1:
+                continue
+            try:
+                return inner_payload.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+    return None
+
+
+def _normalize_file_uri(value: str) -> Optional[str]:
+    """Normalize a ``file://`` URI (or bare absolute path) to a filesystem path.
+
+    Built on ``urllib.parse`` (``urlparse`` + ``unquote``): a ``file://`` URI has
+    its scheme stripped and percent-encoding decoded (AC-2). A bare **absolute**
+    path (starts with ``/``) is accepted and percent-decoded. Anything else
+    (relative paths, non-file schemes, malformed strings) returns ``None`` so it
+    can't poison project-scoped search (D-6, AC-7).
+    """
+    if not value:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme == "file":
+        path = unquote(parsed.path)
+        return path if path.startswith("/") else None
+    if not parsed.scheme:
+        path = unquote(value)
+        return path if path.startswith("/") else None
+    return None
+
+
+def _load_summaries(root: Path) -> Dict[str, str]:
+    """Load the desktop summaries metadata into a ``{conversation_id: path}`` map.
+
+    Reads ``<root>/agyhub_summaries_proto.pb``, walks it (``_walk_length_delimited``),
+    and normalizes each workspace URI (``_normalize_file_uri``), dropping entries
+    whose URI normalizes to ``None``. All file I/O and binary decoding is wrapped
+    defensively: any failure (``OSError``/``PermissionError``/``IndexError``/
+    ``ValueError``/``UnicodeDecodeError``) returns ``{}`` (AC-5).
+    """
+    pb_path = root / "agyhub_summaries_proto.pb"
+    try:
+        data = pb_path.read_bytes()
+        raw = _walk_length_delimited(data)
+    except (OSError, IndexError, ValueError, UnicodeDecodeError):
+        return {}
+    mapping: Dict[str, str] = {}
+    for conversation_id, uri in raw.items():
+        normalized = _normalize_file_uri(uri)
+        if normalized is not None:
+            mapping[conversation_id] = normalized
+    return mapping
 
 
 class AntigravityAdapter:
@@ -61,6 +232,14 @@ class AntigravityAdapter:
     def discover_sources(self) -> List[ProviderSource]:
         transcript_glob = "brain/*/.system_generated/logs/transcript.jsonl"
         history = self._load_history()
+        # Desktop history.jsonl is empty; consult the summaries metadata as a
+        # second resolution layer (SESF-17). Gated to the desktop variant so the
+        # CLI path is provably untouched (AC-6). Parsed once per discovery pass,
+        # mirroring _load_history(). The loader parses the summaries .pb, so a
+        # desktop source's project_root resolves history -> summaries -> "unknown".
+        summaries: Dict[str, str] = {}
+        if self.variant == "desktop":
+            summaries = _load_summaries(self.root)
         sources = []
         for path in sorted(self.root.glob(transcript_glob)):
             conversation_id = path.parents[2].name
@@ -74,7 +253,9 @@ class AntigravityAdapter:
                 logical_session_id=conversation_id,
                 path=str(path),
                 canonical_path=canonical_path,
-                project_root=history.get(conversation_id, "unknown"),
+                project_root=history.get(
+                    conversation_id, summaries.get(conversation_id, "unknown")
+                ),
                 timestamp="",
                 status="eligible",
             ))
@@ -177,7 +358,17 @@ class AntigravityAdapter:
 
     def health(self) -> ProviderHealth:
         sources = self.discover_sources()
-        limitations = ["Protobuf/database artifacts are not parsed in SESF-6."]
+        if self.variant == "desktop":
+            # SESF-17 (AC-8 / D-7): root summaries metadata is now parsed and
+            # consulted for project_root resolution. The genuinely-opaque
+            # per-conversation brain/**/*.pb / *.db artifacts remain unparsed,
+            # so keep naming them — but do not claim full protobuf schema parsing.
+            limitations = [
+                "Root summaries metadata is parsed for project resolution; "
+                "per-conversation brain/**/*.pb (protobuf) and brain/**/*.db artifacts remain opaque in SESF-6."
+            ]
+        else:
+            limitations = ["Protobuf/database artifacts are not parsed in SESF-6."]
         if self._has_opaque_binary_artifacts():
             limitations.append("Opaque protobuf/database artifacts detected; JSONL remains authoritative.")
         return ProviderHealth(
