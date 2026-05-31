@@ -323,7 +323,17 @@ class AntigravityAdapter:
 
     def health(self) -> ProviderHealth:
         sources = self.discover_sources()
-        limitations = ["Protobuf/database artifacts are not parsed in SESF-6."]
+        if self.variant == "desktop":
+            # SESF-17 (AC-8 / D-7): root summaries metadata is now parsed and
+            # consulted for project_root resolution. The genuinely-opaque
+            # per-conversation brain/**/*.pb / *.db artifacts remain unparsed,
+            # so keep naming them — but do not claim full protobuf schema parsing.
+            limitations = [
+                "Root summaries metadata is parsed for project resolution; "
+                "per-conversation brain/**/*.pb (protobuf) and brain/**/*.db artifacts remain opaque in SESF-6."
+            ]
+        else:
+            limitations = ["Protobuf/database artifacts are not parsed in SESF-6."]
         if self._has_opaque_binary_artifacts():
             limitations.append("Opaque protobuf/database artifacts detected; JSONL remains authoritative.")
         return ProviderHealth(
