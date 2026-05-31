@@ -88,43 +88,62 @@ def _iter_length_delimited(data: bytes) -> Iterator[Tuple[int, bytes]]:
 def _walk_length_delimited(data: bytes) -> Dict[str, str]:
     """Decode the Antigravity ``agyhub_summaries_proto.pb`` wire format.
 
-    Schema-free varint / length-delimited walker (stdlib only, D-1). Iterates
-    the **top-level** length-delimited records (a flat sequence, not a single
-    wrapper-with-repeated-field, D-2): Field 1 carries a conversation UUID and
-    Field 2 carries the workspace submessage, decoded recursively via the nested
-    Field 2->9->1 path.
+    Schema-free varint / length-delimited walker (stdlib only, D-1). The file is
+    a sequence of **repeated top-level ``Field 1`` records** (SESF-29): the
+    conversation UUID and workspace submessage live one level *deeper*, inside
+    each record, not flat at the top level. Each top-level ``Field 1`` payload is
+    one conversation record decoded by ``_decode_record``; top-level ``Field 2``
+    entries are unrelated recency metadata (no workspace) and are skipped.
 
-    Field-order independent: protobuf does not guarantee that Field 1 precedes
-    Field 2 within a record. The walker maintains two one-slot queues: one for
-    orphaned Field-1 IDs (arrived without a matching Field-2 yet) and one for
-    orphaned Field-2 URIs (arrived without a matching Field-1 yet). Whenever
-    both queues are non-empty they are paired and emitted immediately, regardless
-    of which arrived first.
-
-    Returns a ``{conversation_id: workspace_uri}`` map. Tolerates
-    ``UnicodeDecodeError`` while decoding individual strings.
+    Returns a ``{conversation_id: workspace_uri}`` map. Records missing either the
+    UUID or the workspace URI are dropped. Tolerates ``UnicodeDecodeError`` while
+    decoding individual strings.
     """
     mapping: Dict[str, str] = {}
-    # One-slot pending queues.  An entry is consumed the moment its partner arrives.
+    for field_number, payload in _iter_length_delimited(data):
+        if field_number != 1:
+            continue
+        record = _decode_record(payload)
+        if record is not None:
+            conversation_id, uri = record
+            mapping[conversation_id] = uri
+    return mapping
+
+
+def _decode_record(record: bytes) -> Optional[Tuple[str, str]]:
+    """Decode one conversation record into a ``(conversation_id, workspace_uri)`` pair.
+
+    Inner ``Field 1`` carries the conversation UUID; inner ``Field 2`` carries the
+    workspace submessage, decoded recursively via the nested ``Field 2->9->1`` path
+    (``_extract_workspace_uri``).
+
+    Field-order independent: protobuf does not guarantee that ``Field 1`` precedes
+    ``Field 2`` within a record, so both halves are collected before pairing.
+    Returns ``None`` when either half is absent (the real file carries a handful
+    of workspace-less records) or fails to decode as UTF-8.
+
+    Per-record fault isolation: a single malformed/truncated record (a varint or
+    length-delimited frame that runs past its own bounds) raises ``IndexError``/
+    ``ValueError`` from the inner walker. That is caught here and the one bad
+    record is dropped, rather than propagating to ``_load_summaries`` and discarding
+    every other valid mapping in the file (AC-5 spirit, extended per-record).
+    """
     pending_id: Optional[str] = None
     pending_uri: Optional[str] = None
-
-    for field_number, payload in _iter_length_delimited(data):
-        if field_number == 1:
-            try:
-                pending_id = payload.decode("utf-8")
-            except UnicodeDecodeError:
-                pending_id = None
-        elif field_number == 2:
-            pending_uri = _extract_workspace_uri(payload)
-
-        # Emit as soon as both slots are filled — handles any arrival order.
-        if pending_id is not None and pending_uri is not None:
-            mapping[pending_id] = pending_uri
-            pending_id = None
-            pending_uri = None
-
-    return mapping
+    try:
+        for field_number, payload in _iter_length_delimited(record):
+            if field_number == 1:
+                try:
+                    pending_id = payload.decode("utf-8")
+                except UnicodeDecodeError:
+                    pending_id = None
+            elif field_number == 2:
+                pending_uri = _extract_workspace_uri(payload)
+    except (IndexError, ValueError):
+        return None
+    if pending_id is not None and pending_uri is not None:
+        return pending_id, pending_uri
+    return None
 
 
 def _extract_workspace_uri(field2: bytes) -> Optional[str]:
