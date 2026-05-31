@@ -224,7 +224,7 @@ def test_project_root_remains_str_path_no_project_name_field_ac7(synthetic_antig
 
     # Mapped conversations carry absolute paths, not derived names.
     roots = {s.logical_session_id: s.project_root for s in sources}
-    for conversation_id, workspace_path in fixture["mapped"].items():
+    for conversation_id in fixture["mapped"]:
         assert roots[conversation_id].startswith("/")
 
 
