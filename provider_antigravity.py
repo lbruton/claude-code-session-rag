@@ -121,17 +121,26 @@ def _decode_record(record: bytes) -> Optional[Tuple[str, str]]:
     ``Field 2`` within a record, so both halves are collected before pairing.
     Returns ``None`` when either half is absent (the real file carries a handful
     of workspace-less records) or fails to decode as UTF-8.
+
+    Per-record fault isolation: a single malformed/truncated record (a varint or
+    length-delimited frame that runs past its own bounds) raises ``IndexError``/
+    ``ValueError`` from the inner walker. That is caught here and the one bad
+    record is dropped, rather than propagating to ``_load_summaries`` and discarding
+    every other valid mapping in the file (AC-5 spirit, extended per-record).
     """
     pending_id: Optional[str] = None
     pending_uri: Optional[str] = None
-    for field_number, payload in _iter_length_delimited(record):
-        if field_number == 1:
-            try:
-                pending_id = payload.decode("utf-8")
-            except UnicodeDecodeError:
-                pending_id = None
-        elif field_number == 2:
-            pending_uri = _extract_workspace_uri(payload)
+    try:
+        for field_number, payload in _iter_length_delimited(record):
+            if field_number == 1:
+                try:
+                    pending_id = payload.decode("utf-8")
+                except UnicodeDecodeError:
+                    pending_id = None
+            elif field_number == 2:
+                pending_uri = _extract_workspace_uri(payload)
+    except (IndexError, ValueError):
+        return None
     if pending_id is not None and pending_uri is not None:
         return pending_id, pending_uri
     return None
