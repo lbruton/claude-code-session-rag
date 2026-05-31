@@ -209,10 +209,14 @@ def register_tools(server: Server):
             types.Tool(
                 name="search_session",
                 description=(
-                    "Search conversation history for past discussions, decisions, "
-                    "code snippets, and error messages. Ranked by 'hybrid' (blended "
-                    "semantic relevance + recency) by default; pass sort_by to choose "
-                    "'relevance' or 'recency'."
+                    "Search conversation history for past discussions, decisions, code "
+                    "snippets, and error messages. Scoped to the current project when "
+                    "project context is available (sent by the client via the "
+                    "X-Project-Root header); otherwise searches across all sessions. Omit "
+                    "'query' to list the most recent turns chronologically (newest "
+                    "first). Ranked by 'hybrid' (blended semantic relevance + recency) by "
+                    "default; pass sort_by to choose 'relevance' or 'recency'. Use "
+                    "search_all_sessions to target a specific project or all projects."
                 ),
                 inputSchema={
                     "type": "object",
@@ -228,7 +232,7 @@ def register_tools(server: Server):
                         },
                         "session_id": {
                             "type": "string",
-                            "description": "Claude session ID to filter to. Usually auto-resolved; only pass if auto-resolution fails.",
+                            "description": "Optional drill-down: a session ID taken from a prior search result, to narrow the search to that single conversation. Omit to search the current project (or all sessions when no project context is available). (There is no automatic 'current session' — MCP clients do not expose the live session ID to the server; use get_turns with the session_id and turn_index from a result to expand one conversation.)",
                         },
                         "sort_by": {
                             "type": "string",
@@ -243,10 +247,14 @@ def register_tools(server: Server):
             types.Tool(
                 name="search_all_sessions",
                 description=(
-                    "Search across ALL past conversation sessions. Ranked by 'hybrid' "
-                    "(blended semantic relevance + recency) by default; pass sort_by to "
-                    "choose 'relevance' or 'recency'. Optionally filter by git branch or "
-                    "date range."
+                    "Search past conversation sessions. When project context is "
+                    "available (sent by the client via the X-Project-Root header), "
+                    "scopes to that project by default; pass project_root='*' to search "
+                    "every project, or a path to target a specific one. Omit 'query' to "
+                    "list the most recent turns chronologically (newest first) — the best "
+                    "way to recall recent context. Ranked by 'hybrid' (blended semantic "
+                    "relevance + recency) by default; pass sort_by to choose 'relevance' "
+                    "or 'recency'. Optionally filter by git branch, provider, or date range."
                 ),
                 inputSchema=build_search_all_sessions_schema(),
             ),
