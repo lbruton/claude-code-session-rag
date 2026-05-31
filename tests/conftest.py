@@ -245,9 +245,20 @@ def _pb_fixed64_field(field_number: int, value: int) -> bytes:
     return _pb_varint(tag) + struct.pack("<Q", value & 0xFFFFFFFFFFFFFFFF)
 
 
+def _wrap_record(record: bytes) -> bytes:
+    """Frame a record body as a top-level `Field 1` (wt=2) length-delimited entry.
+
+    The real Antigravity `.pb` is a sequence of repeated top-level `Field 1`
+    records; the conversation UUID + workspace submessage live *inside* each
+    record (SESF-29). `_pb_summaries_record` / `_pb_summaries_record_with_extra_wire_types`
+    build the inner record body; this wraps one so it sits at the right depth.
+    """
+    return _pb_len_delimited(0x0A, record)
+
+
 def _pb_summaries_record(conversation_id: str, workspace_uri: str) -> bytes:
     """
-    Build one top-level summaries record mapping a conversation to a workspace URI.
+    Build one summaries record body mapping a conversation to a workspace URI.
 
     Wire layout (all wire type 2, length-delimited):
         Field 1 (0x0A) -> conversation UUID string
@@ -346,15 +357,31 @@ def synthetic_antigravity_desktop_home(tmp_path):
             json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "text": "synthetic desktop plan"}),
         ]) + "\n")
 
-    # Hand-built valid `.pb`: three top-level records (plain, second, percent-encoded),
-    # plus one record with mixed wire types (wt=0/1/5) and reversed field order.
-    # The `file://` URIs carry the scheme prefix; AC-2's normalizer strips it and
-    # `unquote`s the percent-encoded record back to `encoded_decoded`.
+    # Hand-built valid `.pb` matching the REAL Antigravity framing (SESF-29):
+    # the top level is a sequence of repeated `Field 1` records, and the UUID +
+    # workspace live one level deeper *inside* each record. Each record body
+    # (Field 1 = uuid, Field 2->9->1 = uri) is wrapped in a top-level Field 1
+    # length-delimited frame via `_wrap_record`. Records: plain, second,
+    # percent-encoded, plus one with mixed wire types (wt=0/1/5) and reversed
+    # field order. The `file://` URIs carry the scheme prefix; AC-2's normalizer
+    # strips it and `unquote`s the percent-encoded record back to `encoded_decoded`.
     pb_bytes = b"".join([
-        _pb_summaries_record(plain_id, "file://" + plain_ws),
-        _pb_summaries_record(second_id, "file://" + second_ws),
-        _pb_summaries_record(encoded_id, "file://" + encoded_ws),
-        _pb_summaries_record_with_extra_wire_types(mixed_wire_id, "file://" + mixed_wire_ws),
+        _wrap_record(_pb_summaries_record(plain_id, "file://" + plain_ws)),
+        _wrap_record(_pb_summaries_record(second_id, "file://" + second_ws)),
+        _wrap_record(_pb_summaries_record(encoded_id, "file://" + encoded_ws)),
+        _wrap_record(
+            _pb_summaries_record_with_extra_wire_types(mixed_wire_id, "file://" + mixed_wire_ws)
+        ),
+        # Regression guard (SESF-29): a top-level `Field 2` "recency" entry,
+        # mirroring the ~5 such entries in the real file (inner Field 1 = uuid
+        # string, Field 2 = varint timestamp, NO workspace path). The walker must
+        # only descend top-level `Field 1` records and IGNORE this — otherwise
+        # `unmapped_id` would wrongly resolve to a path instead of "unknown" (AC-4).
+        _pb_len_delimited(
+            0x12,
+            _pb_len_delimited(0x0A, unmapped_id.encode("utf-8"))
+            + _pb_varint_field(2, 1779575744),
+        ),
     ])
     pb_path = root / "agyhub_summaries_proto.pb"
     pb_path.write_bytes(pb_bytes)
