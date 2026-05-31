@@ -19,6 +19,35 @@ from provider_adapters import (
 )
 
 
+def _walk_length_delimited(data: bytes) -> Dict[str, str]:
+    """Decode the Antigravity ``agyhub_summaries_proto.pb`` wire format.
+
+    Schema-free varint / length-delimited walker (stdlib only). Returns a
+    ``{conversation_id: workspace_uri}`` map. Stub: parsing logic lands in
+    Cohort C (SESF-17 C.1); currently a no-op returning ``{}``.
+    """
+    return {}
+
+
+def _normalize_file_uri(value: str) -> Optional[str]:
+    """Normalize a ``file://`` URI (or bare absolute path) to a filesystem path.
+
+    Built on ``urllib.parse`` in Cohort C. Stub: returns its input unchanged;
+    no decoding or validation logic yet (SESF-17 C.1).
+    """
+    return value
+
+
+def _load_summaries(root: Path) -> Dict[str, str]:
+    """Load the desktop summaries metadata into a ``{conversation_id: path}`` map.
+
+    Ties ``_walk_length_delimited`` and ``_normalize_file_uri`` together, wrapping
+    all file I/O and binary decoding defensively (returns ``{}`` on any failure).
+    Stub: no parsing logic yet; always returns ``{}`` (SESF-17 C.1).
+    """
+    return {}
+
+
 class AntigravityAdapter:
     def __init__(self, home: str | Path | None = None, source_kind: str = "cli"):
         self.home = Path(home).expanduser() if home is not None else Path.home()
@@ -61,6 +90,14 @@ class AntigravityAdapter:
     def discover_sources(self) -> List[ProviderSource]:
         transcript_glob = "brain/*/.system_generated/logs/transcript.jsonl"
         history = self._load_history()
+        # Desktop history.jsonl is empty; consult the summaries metadata as a
+        # second resolution layer (SESF-17). Gated to the desktop variant so the
+        # CLI path is provably untouched (AC-6). Parsed once per discovery pass,
+        # mirroring _load_history(). Stub loader returns {} until Cohort C, so
+        # desktop project_root still resolves to "unknown" here.
+        summaries: Dict[str, str] = {}
+        if self.variant == "desktop":
+            summaries = _load_summaries(self.root)
         sources = []
         for path in sorted(self.root.glob(transcript_glob)):
             conversation_id = path.parents[2].name
@@ -74,7 +111,9 @@ class AntigravityAdapter:
                 logical_session_id=conversation_id,
                 path=str(path),
                 canonical_path=canonical_path,
-                project_root=history.get(conversation_id, "unknown"),
+                project_root=history.get(
+                    conversation_id, summaries.get(conversation_id, "unknown")
+                ),
                 timestamp="",
                 status="eligible",
             ))
