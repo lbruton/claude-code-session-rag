@@ -39,8 +39,7 @@ Semantic search over agent session transcripts. Independent project, originally 
 
 ## Code Style
 
-- **Docstrings** — every file gets a module docstring. Public functions, classes, and methods are documented Google-style — args, returns, non-obvious behavior. Private symbols (leading `_`) need one only when the name isn't self-explanatory.
-- **Pre-PR gate** — `pip install -r requirements-dev.txt`, then run `ruff check` on the `.py` files you changed. It checks docstring *presence* on public API (`D1` rules, Google convention); style and private symbols are untouched. A bare `ruff check .` still reports the SESF-31 backlog (~92 existing gaps), so scope it to your changed files until that issue clears. Afterward, plain `ruff check .` is the standing guard. Config lives in `ruff.toml`.
+See CLAUDE.md "Code Style" for the docstring policy and the pre-PR `ruff` gate (`ruff.toml`).
 
 ## Issue Tracking
 
