@@ -1,0 +1,24 @@
+# Docstring lint for SessionFlow. Enforces the "Documentation Standards" from
+# DocVault steering (specflow/SessionFlow/steering/structure.md):
+#   - module docstring on every file
+#   - public functions/classes documented (Google-style)
+#   - private symbols (leading underscore) exempt unless the name is unclear
+# pydocstyle's D-rules only flag public (non-underscore) names by design, so the
+# private-symbol exemption is honored automatically. Run `ruff check .` pre-PR.
+target-version = "py313"
+extend-exclude = [".claude", "venv", "__pycache__"]
+
+[lint]
+# D1xx = "missing docstring" rules (D100-D107). This is a COVERAGE gate, matching
+# the steering policy's concern (presence of docstrings). D2xx/D3xx/D4xx style rules
+# are intentionally left off so the gate doesn't churn existing, already-good
+# docstrings (e.g. the established `"""\n...` module-docstring form).
+select = ["D1"]
+
+[lint.pydocstyle]
+convention = "google"        # matches existing Google-style docstrings
+
+[lint.per-file-ignores]
+"tests/**" = ["D"]                     # test functions don't need docstrings
+"migrate_to_standalone.py" = ["D"]     # one-off migration script
+"verify_provider_ingestion.py" = ["D"] # one-off verification script

@@ -37,6 +37,11 @@ Semantic search over agent session transcripts. Independent project, originally 
 - **FTS5 thread affinity (SESF-13)** — `FTSIndex` keeps per-thread persistent connections (`threading.local`). Server-mode connections opened on the embed executor and request threads are isolated, and cross-thread `close_all()` is a no-op rather than a noisy WARN.
 - **OpenCode timestamps (SESF-14)** — `provider_adapters.normalize_timestamp()` coerces int-ms epochs (and any other numeric/datetime input) to ISO-8601 strings before they hit Milvus's `VARCHAR(64)` timestamp field. All four provider adapters route timestamps through it.
 
+## Code Style
+
+- **Docstrings** — follow the steering "Documentation Standards" (`DocVault/specflow/SessionFlow/steering/structure.md`): a module docstring on every file; public functions, classes, and methods documented Google-style (args, returns, non-obvious behavior); private symbols (leading `_`) only when the name isn't self-explanatory.
+- **Pre-PR gate** — `pip install -r requirements-dev.txt` then `ruff check .` (config in `ruff.toml`). It enforces docstring *presence* on public API only (`D1` rules, Google convention); it does not touch style or private symbols. New public symbols without a docstring fail the check.
+
 ## Issue Tracking
 
 Issues use the `SESF-` prefix and are tracked in Plane: <https://plane.lbruton.cc/lbruton/projects/3835ead1-4cc4-4f89-8145-4923068f7403/>.

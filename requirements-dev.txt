@@ -1,0 +1,2 @@
+# Development-only dependencies (linting, etc.). Runtime deps live in requirements.txt.
+ruff>=0.6
