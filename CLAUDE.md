@@ -39,8 +39,8 @@ Semantic search over Claude Code session transcripts. Independent project, origi
 
 ## Code Style
 
-- **Docstrings** — follow the steering "Documentation Standards" (`DocVault/specflow/SessionFlow/steering/structure.md`): a module docstring on every file; public functions, classes, and methods documented Google-style (args, returns, non-obvious behavior); private symbols (leading `_`) only when the name isn't self-explanatory.
-- **Pre-PR gate** — `pip install -r requirements-dev.txt`, then run `ruff check <the .py files you changed>` to confirm new public symbols are documented (`D1` rules, Google convention; style and private symbols untouched). A bare `ruff check .` currently reports the SESF-31 backlog (~92 existing gaps), so scope it to the files you touched until that issue clears; afterward, plain `ruff check .` is the standing guard. Config in `ruff.toml`.
+- **Docstrings** — follow the steering "Documentation Standards" (`DocVault/specflow/SessionFlow/steering/structure.md`). Every file gets a module docstring. Public functions, classes, and methods are documented Google-style — args, returns, non-obvious behavior. Private symbols (leading `_`) need one only when the name isn't self-explanatory.
+- **Pre-PR gate** — `pip install -r requirements-dev.txt`, then run `ruff check` on the `.py` files you changed. It checks docstring *presence* on public API (`D1` rules, Google convention); style and private symbols are untouched. A bare `ruff check .` still reports the SESF-31 backlog (~92 existing gaps), so scope it to your changed files until that issue clears. Afterward, plain `ruff check .` is the standing guard. Config lives in `ruff.toml`.
 
 ## Issue Tracking
 
