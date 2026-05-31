@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlparse
 import hashlib
 import json
 
@@ -19,33 +20,139 @@ from provider_adapters import (
 )
 
 
+_VARINT_MAX_BYTES = 10  # max bytes for a 64-bit base-128 varint (D-1).
+
+
+def _read_varint(data: bytes, pos: int) -> Tuple[int, int]:
+    """Read a base-128 varint from ``data`` at ``pos``.
+
+    Returns ``(value, next_pos)``. Caps the varint at 10 bytes (the max for a
+    64-bit value) and raises ``ValueError`` past that so a malformed/truncated
+    stream can't spin in an infinite loop (D-1). Raises ``IndexError`` on a
+    short read past the end of the buffer.
+    """
+    value = 0
+    shift = 0
+    for read in range(_VARINT_MAX_BYTES):
+        byte = data[pos + read]
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos + read + 1
+        shift += 7
+    raise ValueError("varint exceeds 10 bytes (truncated or malformed stream)")
+
+
+def _iter_length_delimited(data: bytes):
+    """Yield ``(field_number, payload)`` for every wire-type-2 field in ``data``.
+
+    Tolerant of trailing/non-length-delimited fields: a tag whose wire type is
+    not 2 (length-delimited) raises ``ValueError`` (unexpected framing) so the
+    caller can degrade to ``"unknown"`` rather than mis-decode. ``IndexError``
+    from a short read also propagates up to the defensive loader (AC-5).
+    """
+    pos = 0
+    length = len(data)
+    while pos < length:
+        tag, pos = _read_varint(data, pos)
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if wire_type != 2:
+            raise ValueError(f"unsupported wire type {wire_type} for field {field_number}")
+        size, pos = _read_varint(data, pos)
+        end = pos + size
+        if end > length:
+            raise IndexError("length-delimited payload runs past end of buffer")
+        yield field_number, data[pos:end]
+        pos = end
+
+
 def _walk_length_delimited(data: bytes) -> Dict[str, str]:
     """Decode the Antigravity ``agyhub_summaries_proto.pb`` wire format.
 
-    Schema-free varint / length-delimited walker (stdlib only). Returns a
-    ``{conversation_id: workspace_uri}`` map. Stub: parsing logic lands in
-    Cohort C (SESF-17 C.1); currently a no-op returning ``{}``.
+    Schema-free varint / length-delimited walker (stdlib only, D-1). Iterates
+    the **top-level** length-delimited records (a flat sequence, not a single
+    wrapper-with-repeated-field, D-2): a Field 1 carries a conversation UUID and
+    the following Field 2 carries the workspace submessage, decoded recursively
+    via the nested Field 2->9->1 path. Returns a ``{conversation_id: workspace_uri}``
+    map. Tolerates ``UnicodeDecodeError`` while decoding individual strings.
     """
-    return {}
+    mapping: Dict[str, str] = {}
+    pending_id: Optional[str] = None
+    for field_number, payload in _iter_length_delimited(data):
+        if field_number == 1:
+            try:
+                pending_id = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                pending_id = None
+        elif field_number == 2 and pending_id is not None:
+            uri = _extract_workspace_uri(payload)
+            if uri is not None:
+                mapping[pending_id] = uri
+            pending_id = None
+    return mapping
+
+
+def _extract_workspace_uri(field2: bytes) -> Optional[str]:
+    """Decode the nested Field 2->9->1 submessage path to a workspace URI string.
+
+    Returns the decoded URI, or ``None`` if the expected nesting is absent or a
+    string fails to decode as UTF-8.
+    """
+    for field_number, payload in _iter_length_delimited(field2):
+        if field_number != 9:
+            continue
+        for inner_number, inner_payload in _iter_length_delimited(payload):
+            if inner_number != 1:
+                continue
+            try:
+                return inner_payload.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+    return None
 
 
 def _normalize_file_uri(value: str) -> Optional[str]:
     """Normalize a ``file://`` URI (or bare absolute path) to a filesystem path.
 
-    Built on ``urllib.parse`` in Cohort C. Stub: returns its input unchanged;
-    no decoding or validation logic yet (SESF-17 C.1).
+    Built on ``urllib.parse`` (``urlparse`` + ``unquote``): a ``file://`` URI has
+    its scheme stripped and percent-encoding decoded (AC-2). A bare **absolute**
+    path (starts with ``/``) is accepted and percent-decoded. Anything else
+    (relative paths, non-file schemes, malformed strings) returns ``None`` so it
+    can't poison project-scoped search (D-6, AC-7).
     """
-    return value
+    if not value:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme == "file":
+        path = unquote(parsed.path)
+        return path if path.startswith("/") else None
+    if not parsed.scheme:
+        path = unquote(value)
+        return path if path.startswith("/") else None
+    return None
 
 
 def _load_summaries(root: Path) -> Dict[str, str]:
     """Load the desktop summaries metadata into a ``{conversation_id: path}`` map.
 
-    Ties ``_walk_length_delimited`` and ``_normalize_file_uri`` together, wrapping
-    all file I/O and binary decoding defensively (returns ``{}`` on any failure).
-    Stub: no parsing logic yet; always returns ``{}`` (SESF-17 C.1).
+    Reads ``<root>/agyhub_summaries_proto.pb``, walks it (``_walk_length_delimited``),
+    and normalizes each workspace URI (``_normalize_file_uri``), dropping entries
+    whose URI normalizes to ``None``. All file I/O and binary decoding is wrapped
+    defensively: any failure (``OSError``/``PermissionError``/``IndexError``/
+    ``ValueError``/``UnicodeDecodeError``) returns ``{}`` (AC-5).
     """
-    return {}
+    pb_path = root / "agyhub_summaries_proto.pb"
+    try:
+        data = pb_path.read_bytes()
+        raw = _walk_length_delimited(data)
+    except (OSError, IndexError, ValueError, UnicodeDecodeError):
+        return {}
+    mapping: Dict[str, str] = {}
+    for conversation_id, uri in raw.items():
+        normalized = _normalize_file_uri(uri)
+        if normalized is not None:
+            mapping[conversation_id] = normalized
+    return mapping
 
 
 class AntigravityAdapter:
