@@ -723,8 +723,9 @@ mcp_server = Server(
     instructions=(
         "SessionFlow provides semantic search over conversation history across all "
         "harnesses (Claude Code, Codex, OpenCode, Antigravity). To recall recent context "
-        "for the project you are working in, use search_all_sessions (it scopes to the "
-        "current project by default; pass project_root='*' to search every project). Omit "
+        "for the project you are working in, use search_all_sessions — when project "
+        "context is available (the client's X-Project-Root header) it scopes to that "
+        "project by default; pass project_root='*' to search every project. Omit "
         "'query' to list the most recent turns chronologically. Results are 'hybrid'-"
         "ranked (semantic relevance blended with recency) by default; pass sort_by="
         "'relevance' or 'recency' to change that. To expand a specific hit, call get_turns "
