@@ -422,7 +422,12 @@ def stub_rag_engine(monkeypatch):
     ) -> int:
         return len(turns)
 
+    async def get_issue_timeline_async(*args: object, **kwargs: object) -> list:
+        return []
+
     module = types.SimpleNamespace(
+        get_issue_timeline=lambda *args, **kwargs: [],
+        get_issue_timeline_async=get_issue_timeline_async,
         search=lambda *args, **kwargs: [],
         get_turns=lambda *args, **kwargs: [],
         get_stats=lambda *args, **kwargs: {
