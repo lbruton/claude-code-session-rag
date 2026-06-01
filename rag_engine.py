@@ -68,6 +68,8 @@ _ISSUE_ID_PREFIX_DENYLIST = frozenset(
 )
 # Milvus VARCHAR field length the extracted ids are stored in.
 _ISSUE_ID_FIELD_MAX = 4096
+# Default number of timeline entries returned by get_issue_timeline (SESF-25/26).
+DEFAULT_TIMELINE_LIMIT = 50
 
 
 def _extract_issue_ids(text: str) -> str:
@@ -989,6 +991,137 @@ def _recent_listing(n: int, session_id: Optional[str] = None,
     mapped = [_row_to_result(row, defaults, distance=1.0) for row in rows]
 
     return _rank_results(mapped, "recency", n)
+
+
+def _timeline_entry(row: Dict) -> Dict:
+    """Normalize a structured or FTS source row to the timeline entry shape.
+
+    Both sources are reduced to one shape so the merge/dedup/sort logic is
+    source-agnostic. ``text`` is read from any of ``text``/``document``/
+    ``content`` (the structured field uses ``document``; the FTS sidecar uses
+    ``content``). Each entry carries provider, session_id, timestamp, role and
+    chunk_type, text, doc_id, and issue_ids (Req 4.6).
+    """
+    role = row.get("role", row.get("chunk_type", ""))
+    return {
+        "doc_id": row.get("doc_id", ""),
+        "timestamp": row.get("timestamp", ""),
+        "provider": row.get("provider", ""),
+        "session_id": row.get("session_id", ""),
+        "role": role,
+        "chunk_type": row.get("chunk_type", role),
+        "text": row.get("text", row.get("document", row.get("content", ""))),
+        "issue_ids": row.get("issue_ids", ""),
+    }
+
+
+def get_issue_timeline(issue_id: str, *, limit: int = DEFAULT_TIMELINE_LIMIT,
+                       providers: Optional[List[str]] = None,
+                       date_from: Optional[str] = None,
+                       date_to: Optional[str] = None,
+                       db_path: Optional[str] = None) -> List[Dict]:
+    """Cross-harness, deduplicated, chronological feed of turns for an issue.
+
+    Unions a structured Milvus source (``issue_ids like "%,ID,%"`` drained
+    uncapped via ``_query_all``) with an FTS keyword fallback (a literal MATCH on
+    the issue token) so any un-tagged turn remains visible (Req 6.1). Both
+    sources are normalized to the same shape, merged and deduplicated by
+    ``doc_id`` (Req 4.2/6.2), filtered to an optional ``providers`` subset
+    (Req 4.4) and ``date_from``/``date_to`` bounds (Req 4.3), sorted oldest-first
+    by ``(timestamp asc, doc_id asc)`` (Req 4.1), and sliced to ``limit``
+    (Req 4.5). An FTS failure is non-fatal — the feed degrades to the structured
+    source with a logged warning.
+
+    Args:
+        issue_id: The tracker issue token (e.g. ``"SESF-25"``); uppercased and
+            escaped at this boundary before it reaches Milvus.
+        limit: Maximum number of entries to return (default
+            ``DEFAULT_TIMELINE_LIMIT``).
+        providers: Optional allow-list of provider names to keep.
+        date_from: Optional inclusive ISO-8601 lower bound on ``timestamp``.
+        date_to: Optional inclusive ISO-8601 upper bound on ``timestamp``.
+        db_path: Optional Milvus DB path override (also drives the FTS sidecar).
+
+    Returns:
+        A list of timeline entry dicts, oldest first; ``[]`` when nothing
+        references the issue (Req 4.7).
+    """
+    canonical = issue_id.upper()
+    filter_expr = _build_milvus_filter(
+        None, None, None, None, None, date_from, date_to, issue_id=canonical,
+    )
+
+    output_fields = ["document", "doc_id", "session_id", "timestamp",
+                     "chunk_type", "provider", "issue_ids"]
+    structured = _query_all(output_fields, filter_expr=filter_expr, db_path=db_path)
+
+    # FTS keyword fallback (Req 6.1): boundary-aware literal match on the token.
+    # Non-fatal — degrade to the structured source on any FTS error (structure.md).
+    try:
+        fts_hits = _fts.search(canonical, n=limit, db_path=db_path)
+    except Exception as e:
+        logger.warning("FTS fallback failed for issue timeline %s (non-fatal): %s", canonical, e)
+        fts_hits = []
+
+    merged: Dict[str, Dict] = {}
+    for row in list(structured) + list(fts_hits):
+        entry = _timeline_entry(row)
+        merged.setdefault(entry["doc_id"], entry)
+
+    entries = list(merged.values())
+
+    if providers:
+        allowed = set(providers)
+        entries = [e for e in entries if e.get("provider") in allowed]
+    if date_from:
+        entries = [e for e in entries if e.get("timestamp", "") >= date_from]
+    if date_to:
+        upper = date_to.split("T")[0] + "T23:59:59"
+        entries = [e for e in entries if e.get("timestamp", "") <= upper]
+    # Boundary-aware FTS guard: keep only turns that actually reference the token
+    # (FTS may surface substring/word-stem noise). The structured source is
+    # already exact via the comma-wrapped LIKE.
+    token = f",{canonical},"
+    entries = [
+        e for e in entries
+        if token in (e.get("issue_ids") or "")
+        or _references_issue(e.get("text", ""), canonical)
+    ]
+
+    entries.sort(key=lambda e: (e.get("timestamp", ""), e.get("doc_id", "")))
+    return entries[:limit]
+
+
+def _references_issue(text: str, canonical: str) -> bool:
+    """Whether text contains the issue token as a whole word (case-insensitive).
+
+    Boundary-anchored so ``SESF-42`` does not match ``SESF-420`` (Req 6.3).
+    """
+    if not text:
+        return False
+    pattern = r"\b" + re.escape(canonical) + r"\b"
+    return re.search(pattern, text.upper()) is not None
+
+
+async def get_issue_timeline_async(issue_id: str, *,
+                                   limit: int = DEFAULT_TIMELINE_LIMIT,
+                                   providers: Optional[List[str]] = None,
+                                   date_from: Optional[str] = None,
+                                   date_to: Optional[str] = None,
+                                   db_path: Optional[str] = None) -> List[Dict]:
+    """Async wrapper over ``get_issue_timeline`` (mirrors ``search_async``).
+
+    Runs the synchronous core in the default executor. The timeline does no
+    embedding, so it does not require the MLX embed semaphore.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: get_issue_timeline(
+            issue_id, limit=limit, providers=providers,
+            date_from=date_from, date_to=date_to, db_path=db_path,
+        ),
+    )
 
 
 def _parse_timestamp_utc(ts: str) -> Optional[datetime]:
