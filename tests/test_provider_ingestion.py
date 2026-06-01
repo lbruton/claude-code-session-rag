@@ -131,6 +131,55 @@ def test_add_turns_empty_issue_ids_when_no_token(monkeypatch):
     assert fts_records[0]["issue_ids"] == ""
 
 
+def test_backfill_fts_rehydrates_issue_ids(monkeypatch):
+    # Req 1.5 — issue_ids fetched from Milvus must survive the FTS re-hydration
+    # round-trip in backfill_fts(); a dropped key silently zeroes the field.
+    doc_id = "doc-backfill"
+
+    class _FTSConn:
+        def execute(self, *args, **kwargs):
+            class _Cursor:
+                def fetchall(self):
+                    return []  # nothing in FTS yet → the doc is "missing"
+
+            return _Cursor()
+
+    class _BackfillMilvus:
+        def query(self, *args, **kwargs):
+            return [{
+                "doc_id": doc_id,
+                "document": "Working on SESF-25",
+                "session_id": "s1",
+                "timestamp": "2026-05-01T10:00:00",
+                "issue_ids": ",SESF-25,",
+            }]
+
+    @contextmanager
+    def _fake_client(db_path=None):
+        yield _BackfillMilvus()
+
+    monkeypatch.setattr(rag_engine, "milvus_client", _fake_client)
+    monkeypatch.setattr(
+        rag_engine, "_query_batches",
+        lambda *args, **kwargs: iter([[{"doc_id": doc_id}]]),
+    )
+
+    fts_records: list[dict] = []
+    monkeypatch.setattr(rag_engine._fts, "connection", lambda db_path: _FTSConn())
+    monkeypatch.setattr(
+        rag_engine._fts, "insert", lambda conn, records: fts_records.extend(records)
+    )
+    monkeypatch.setattr(rag_engine._fts, "close_ephemeral", lambda conn: None)
+
+    inserted = rag_engine.backfill_fts(db_path="/tmp/sessionflow-backfill-test.db")
+
+    assert inserted == 1
+    assert fts_records
+    rec = fts_records[0]
+    assert "issue_ids" in rec
+    assert rec["issue_ids"] == ",SESF-25,"
+
+
 @pytest.mark.anyio
 async def test_provider_ingestion_drains_codex_job_to_index_and_cursor(
     tmp_path,

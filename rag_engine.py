@@ -1375,6 +1375,7 @@ def backfill_fts(db_path: Optional[str] = None) -> int:
                             "timestamp": r.get("timestamp", ""),
                             "chunk_type": r.get("chunk_type", "turn"),
                             "project_root": r.get("project_root", ""),
+                            "issue_ids": r.get("issue_ids", ""),
                         }
                         for r in batch
                     ]
