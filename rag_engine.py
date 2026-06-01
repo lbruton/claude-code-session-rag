@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -59,6 +60,61 @@ RECENT_LISTING_SCAN_CAP = 16384
 _RANKING_SCRATCH_KEYS = ("_rrf_score", "_score", "_semantic_score", "_recency_score")
 
 logger = logging.getLogger("sessionflow.milvus")
+
+# Issue-ID extraction (SESF-25): technical-standard prefixes that match the
+# issue-token regex but are never issue references. Dropped during extraction.
+_ISSUE_ID_PREFIX_DENYLIST = frozenset(
+    {"UTF", "SHA", "HTTP", "HTTPS", "ISO", "RFC", "IPV", "MD", "BASE"}
+)
+# Milvus VARCHAR field length the extracted ids are stored in.
+_ISSUE_ID_FIELD_MAX = 4096
+
+
+def _extract_issue_ids(text: str) -> str:
+    """Extract issue references (e.g. ``SESF-25``) from a turn's text.
+
+    Uppercases the input, matches the issue-token regex
+    ``\\b[A-Z][A-Z0-9]+-\\d+\\b``, drops technical-standard prefixes in
+    ``_ISSUE_ID_PREFIX_DENYLIST`` (UTF-8, SHA-256, HTTP-2, ...), and
+    deduplicates the survivors in first-seen order.
+
+    Args:
+        text: Raw turn text to scan.
+
+    Returns:
+        A delimiter-wrapped, comma-joined string of issue ids with a leading
+        and trailing comma (e.g. ``",SESF-25,SESF-26,"``), or ``""`` when no
+        issue token is found. The result is capped to ``_ISSUE_ID_FIELD_MAX``
+        characters so a Milvus insert cannot overflow the storage field; if the
+        next id would exceed the cap, extraction stops and logs one warning.
+    """
+    seen: List[str] = []
+    seen_set: set[str] = set()
+    for match in re.finditer(r"\b[A-Z][A-Z0-9]+-\d+\b", text.upper()):
+        token = match.group(0)
+        prefix = token.split("-", 1)[0]
+        if prefix in _ISSUE_ID_PREFIX_DENYLIST:
+            continue
+        if token in seen_set:
+            continue
+        seen_set.add(token)
+        seen.append(token)
+
+    if not seen:
+        return ""
+
+    result = ","
+    for token in seen:
+        candidate = result + token + ","
+        if len(candidate) > _ISSUE_ID_FIELD_MAX:
+            logger.warning(
+                "issue-id list truncated at %d chars (field cap %d)",
+                len(result),
+                _ISSUE_ID_FIELD_MAX,
+            )
+            break
+        result = candidate
+    return result
 
 
 def _truncate_utf8(text: str, max_bytes: int) -> str:
