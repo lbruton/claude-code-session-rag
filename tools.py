@@ -196,6 +196,10 @@ def build_search_all_sessions_schema() -> dict:
                 "type": "string",
                 "description": "ISO date upper bound, inclusive (e.g., '2026-04-02'). Only returns turns on or before this date.",
             },
+            "issue_id": {
+                "type": "string",
+                "description": "Optional issue id filter (e.g., 'SESF-25'). Restricts results to turns tagged with that issue; case-insensitive.",
+            },
         },
         "required": [],
     }
@@ -239,6 +243,10 @@ def register_tools(server: Server):
                             "enum": ["relevance", "recency", "hybrid"],
                             "description": "Ranking strategy: 'relevance' (pure semantic), 'recency' (newest first), or 'hybrid' (blended, default).",
                             "default": "hybrid",
+                        },
+                        "issue_id": {
+                            "type": "string",
+                            "description": "Optional issue id filter (e.g., 'SESF-25'). Restricts results to turns tagged with that issue; case-insensitive.",
                         },
                     },
                     "required": [],
@@ -343,6 +351,7 @@ def register_tools(server: Server):
                     session_id=session_id,
                     project_root=current_project,
                     sort_by=sort_by_arg,
+                    issue_id=arguments.get("issue_id"),
                     db_path=db,
                 )
                 return [types.TextContent(type="text", text=format_results(results))]
@@ -378,6 +387,7 @@ def register_tools(server: Server):
                     date_to=arguments.get("date_to"),
                     provider=arguments.get("provider"),
                     source_kind=arguments.get("source_kind"),
+                    issue_id=arguments.get("issue_id"),
                     db_path=db,
                 )
                 return [types.TextContent(type="text", text=format_results(results))]

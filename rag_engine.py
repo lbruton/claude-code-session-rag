@@ -769,7 +769,8 @@ def _row_to_result(entity: Dict, defaults: Dict, distance: float = 1.0) -> Dict:
 def _build_milvus_filter(session_id: Optional[str], git_branch: Optional[str],
                          project_root: Optional[str], provider: Optional[str],
                          source_kind: Optional[str], date_from: Optional[str],
-                         date_to: Optional[str]) -> Optional[str]:
+                         date_to: Optional[str],
+                         issue_id: Optional[str] = None) -> Optional[str]:
     """Compose the Milvus boolean-expression filter shared by vector search and
     the query-less recency listing. Returns None when no filters apply.
 
@@ -795,6 +796,8 @@ def _build_milvus_filter(session_id: Optional[str], git_branch: Optional[str],
         # datetime string.
         date_to_date = date_to.split("T")[0]
         filters.append(f'timestamp <= "{_escape_filter_scalar(date_to_date)}T23:59:59"')
+    if issue_id:
+        filters.append(f'issue_ids like "%,{_escape_filter_scalar(issue_id.upper())},%"')
     return " && ".join(filters) if filters else None
 
 
@@ -803,6 +806,7 @@ def search(query: Optional[str], n: int = 5, session_id: Optional[str] = None,
            sort_by: str = "hybrid",
            date_from: Optional[str] = None, date_to: Optional[str] = None,
            provider: Optional[str] = None, source_kind: Optional[str] = None,
+           issue_id: Optional[str] = None,
            db_path: Optional[str] = None) -> List[Dict]:
     """Hybrid search: vector similarity + FTS5 keyword search, merged with RRF.
 
@@ -815,6 +819,8 @@ def search(query: Optional[str], n: int = 5, session_id: Optional[str] = None,
     searches across all projects (cross-project search).
     date_from/date_to: ISO 8601 date strings (e.g. '2026-04-02') to restrict
     results to a time range. Timestamps are VARCHAR and sort lexicographically.
+    issue_id: when set, restricts results to turns tagged with that issue id
+    (e.g. 'SESF-25'); uppercased and matched as an exact comma-delimited token.
     """
     # Validate sort_by before any embedding/Milvus work (mirrors the
     # provider/source_kind entry-point validation below).
@@ -847,7 +853,7 @@ def search(query: Optional[str], n: int = 5, session_id: Optional[str] = None,
             n, session_id=session_id, git_branch=git_branch,
             project_root=project_root, provider=provider,
             source_kind=source_kind, date_from=date_from, date_to=date_to,
-            db_path=db_path,
+            issue_id=issue_id, db_path=db_path,
         )
 
     # Expanded candidate pool for both engines
@@ -858,7 +864,7 @@ def search(query: Optional[str], n: int = 5, session_id: Optional[str] = None,
 
     filter_expr = _build_milvus_filter(
         session_id, git_branch, project_root, provider, source_kind,
-        date_from, date_to,
+        date_from, date_to, issue_id,
     )
 
     search_params = {"metric_type": "COSINE"}
@@ -947,6 +953,7 @@ def _recent_listing(n: int, session_id: Optional[str] = None,
                     source_kind: Optional[str] = None,
                     date_from: Optional[str] = None,
                     date_to: Optional[str] = None,
+                    issue_id: Optional[str] = None,
                     db_path: Optional[str] = None) -> List[Dict]:
     """Query-less chronological listing: filter-only Milvus scan re-ranked by
     timestamp descending (SESF-16).
@@ -958,7 +965,7 @@ def _recent_listing(n: int, session_id: Optional[str] = None,
     """
     filter_expr = _build_milvus_filter(
         session_id, git_branch, project_root, provider, source_kind,
-        date_from, date_to,
+        date_from, date_to, issue_id,
     )
 
     with milvus_client(db_path) as client:
