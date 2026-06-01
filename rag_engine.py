@@ -320,7 +320,7 @@ _persistent_clients: Dict[str, MilvusClient] = {}
 _fts = FTSIndex("turns_fts", [
     "session_id", "git_branch", "turn_index", "timestamp", "chunk_type",
     "project_root", "logical_session_id", "provider", "source_kind",
-    "source_class", "source_id", "source_path",
+    "source_class", "source_id", "source_path", "issue_ids",
 ])
 _write_lock: Optional[asyncio.Lock] = None
 _embed_semaphore: Optional[asyncio.Semaphore] = None
@@ -684,6 +684,7 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
             "git_branch": turn.get("git_branch", ""),
             "chunk_type": turn.get("chunk_type", "turn"),
             "project_root": turn.get("project_root", ""),
+            "issue_ids": _extract_issue_ids(turn.get("text", "")),
         })
 
     with milvus_client(db_path) as client:
@@ -708,6 +709,7 @@ def add_turns(turns: List[Dict], db_path: Optional[str] = None) -> int:
                 "timestamp": t.get("timestamp", ""),
                 "chunk_type": t.get("chunk_type", "turn"),
                 "project_root": t.get("project_root", ""),
+                "issue_ids": _extract_issue_ids(t.get("text", "")),
             } for t in new_turns]
             _fts.insert(fts_conn, fts_records)
             _fts.close_ephemeral(fts_conn)
@@ -1340,7 +1342,7 @@ def backfill_fts(db_path: Optional[str] = None) -> int:
         output_fields = ["doc_id", "document", "session_id", "git_branch",
                          "turn_index", "timestamp", "chunk_type", "project_root",
                          "logical_session_id", "provider", "source_kind",
-                         "source_class", "source_id", "source_path"]
+                         "source_class", "source_id", "source_path", "issue_ids"]
         backfill_defaults = default_provider_metadata()
         BATCH_FETCH = 100
         inserted = 0
