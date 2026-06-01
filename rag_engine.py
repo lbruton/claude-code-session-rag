@@ -434,6 +434,7 @@ def _expected_schema_fields() -> List[FieldSchema]:
         FieldSchema(name="git_branch", dtype=DataType.VARCHAR, max_length=256),
         FieldSchema(name="chunk_type", dtype=DataType.VARCHAR, max_length=64),
         FieldSchema(name="project_root", dtype=DataType.VARCHAR, max_length=512),
+        FieldSchema(name="issue_ids", dtype=DataType.VARCHAR, max_length=_ISSUE_ID_FIELD_MAX),
     ]
 
 
@@ -758,6 +759,7 @@ def _row_to_result(entity: Dict, defaults: Dict, distance: float = 1.0) -> Dict:
         "git_branch": entity.get("git_branch", ""),
         "chunk_type": entity.get("chunk_type", ""),
         "project_root": entity.get("project_root", ""),
+        "issue_ids": entity.get("issue_ids", ""),
         "distance": distance,
     }
 
