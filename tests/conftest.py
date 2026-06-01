@@ -423,7 +423,9 @@ def stub_rag_engine(monkeypatch):
         return len(turns)
 
     async def get_issue_timeline_async(*args: object, **kwargs: object) -> list:
-        return []
+        # Mirror the real wrapper, which runs the sync core in an executor, so a
+        # test that reassigns the sync `get_issue_timeline` is reflected here too.
+        return module.get_issue_timeline(*args, **kwargs)
 
     module = types.SimpleNamespace(
         get_issue_timeline=lambda *args, **kwargs: [],
